@@ -1,0 +1,32 @@
+# Dependencias
+node_modules/
+dist/
+build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Variables de entorno con secretos
+.env
+.env.*
+config.env
+
+# Logs
+*.log
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Claude Code (memoria local, no aplica en otra máquina)
+.claude/
+memory/
+MEMORY.md
+
+# IDE
+.vscode/
+.idea/

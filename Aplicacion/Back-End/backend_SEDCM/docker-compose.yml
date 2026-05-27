@@ -1,0 +1,211 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sedcm-postgres
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: sedcm-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -t '$$SYS/broker/version' -C 1 -W 2 > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sedcm-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    environment:
+      HTTP_PORT: 3000
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_CLIENT_ID: backend-sedcm-docker
+      MQTT_CONNECT_TIMEOUT_MS: 5000
+      MQTT_RECONNECT_PERIOD_MS: 3000
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGSSLMODE: disable
+      NODE_ESCALATION_GRACE_MS: 30000
+      OFFLINE_TIMEOUT_MS: 30000
+      OFFLINE_SWEEP_INTERVAL_MS: 10000
+      CORS_ORIGIN: "*"
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  edge-executor-a1:
+    build:
+      context: ./edge-executor
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-executor-a1
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: A
+      EDGE_RACK: A1
+      EXECUTOR_ID: executor-A1
+      ACK_DELAY_MS: 500
+      ACK_MODE: ACKED
+
+  edge-collector-a1:
+    build:
+      context: ./edge-collector
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-collector-a1
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: A
+      EDGE_RACK: A1
+      NODE_ID: N1
+      COLLECTOR_ID: collector-A1
+      NODE_INTERVAL_MS: 5000
+      ENV_INTERVAL_MS: 10000
+      SCENARIO: critical_node
+
+  edge-executor-a2:
+    build:
+      context: ./edge-executor
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-executor-a2
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: A
+      EDGE_RACK: A2
+      EXECUTOR_ID: executor-A2
+      ACK_DELAY_MS: 500
+      ACK_MODE: ACKED
+
+  edge-collector-a2:
+    build:
+      context: ./edge-collector
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-collector-a2
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: A
+      EDGE_RACK: A2
+      NODE_ID: N2
+      COLLECTOR_ID: collector-A2
+      NODE_INTERVAL_MS: 5000
+      ENV_INTERVAL_MS: 10000
+      SCENARIO: normal
+
+  edge-executor-b1:
+    build:
+      context: ./edge-executor
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-executor-b1
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: B
+      EDGE_RACK: B1
+      EXECUTOR_ID: executor-B1
+      ACK_DELAY_MS: 500
+      ACK_MODE: ACKED
+
+  edge-collector-b1:
+    build:
+      context: ./edge-collector
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-collector-b1
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: B
+      EDGE_RACK: B1
+      NODE_ID: N3
+      COLLECTOR_ID: collector-B1
+      NODE_INTERVAL_MS: 5000
+      ENV_INTERVAL_MS: 10000
+      SCENARIO: warning
+
+  edge-executor-b2:
+    build:
+      context: ./edge-executor
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-executor-b2
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: B
+      EDGE_RACK: B2
+      EXECUTOR_ID: executor-B2
+      ACK_DELAY_MS: 500
+      ACK_MODE: ACKED
+
+  edge-collector-b2:
+    build:
+      context: ./edge-collector
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-collector-b2
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      EDGE_ZONE: B
+      EDGE_RACK: B2
+      NODE_ID: N4
+      COLLECTOR_ID: collector-B2
+      NODE_INTERVAL_MS: 5000
+      ENV_INTERVAL_MS: 10000
+      SCENARIO: critical_environment
+
+volumes:
+  pgdata:
