@@ -71,141 +71,89 @@ services:
       retries: 10
       start_period: 15s
 
-  edge-executor-a1:
+  edge-agent-a1:
     build:
-      context: ./edge-executor
+      context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-executor-a1
+    container_name: sedcm-edge-agent-a1
     depends_on:
       mosquitto:
         condition: service_healthy
     environment:
-      MQTT_URL: mqtt://mosquitto:1883
-      EDGE_ZONE: A
-      EDGE_RACK: A1
-      EXECUTOR_ID: executor-A1
-      ACK_DELAY_MS: 500
-      ACK_MODE: ACKED
-
-  edge-collector-a1:
-    build:
-      context: ./edge-collector
-      dockerfile: Dockerfile
-    container_name: sedcm-edge-collector-a1
-    depends_on:
-      mosquitto:
-        condition: service_healthy
-    environment:
-      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
       EDGE_ZONE: A
       EDGE_RACK: A1
       NODE_ID: N1
-      COLLECTOR_ID: collector-A1
-      NODE_INTERVAL_MS: 5000
-      ENV_INTERVAL_MS: 10000
-      SCENARIO: critical_node
+      EXECUTOR_ID: executor-A1
+      NODE_INTERVAL_S: 5
+      ENV_INTERVAL_S: 10
+      ACK_DELAY_S: 0.5
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
-  edge-executor-a2:
+  edge-agent-a2:
     build:
-      context: ./edge-executor
+      context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-executor-a2
+    container_name: sedcm-edge-agent-a2
     depends_on:
       mosquitto:
         condition: service_healthy
     environment:
-      MQTT_URL: mqtt://mosquitto:1883
-      EDGE_ZONE: A
-      EDGE_RACK: A2
-      EXECUTOR_ID: executor-A2
-      ACK_DELAY_MS: 500
-      ACK_MODE: ACKED
-
-  edge-collector-a2:
-    build:
-      context: ./edge-collector
-      dockerfile: Dockerfile
-    container_name: sedcm-edge-collector-a2
-    depends_on:
-      mosquitto:
-        condition: service_healthy
-    environment:
-      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
       EDGE_ZONE: A
       EDGE_RACK: A2
       NODE_ID: N2
-      COLLECTOR_ID: collector-A2
-      NODE_INTERVAL_MS: 5000
-      ENV_INTERVAL_MS: 10000
-      SCENARIO: normal
+      EXECUTOR_ID: executor-A2
+      NODE_INTERVAL_S: 5
+      ENV_INTERVAL_S: 10
+      ACK_DELAY_S: 0.5
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
-  edge-executor-b1:
+  edge-agent-b1:
     build:
-      context: ./edge-executor
+      context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-executor-b1
+    container_name: sedcm-edge-agent-b1
     depends_on:
       mosquitto:
         condition: service_healthy
     environment:
-      MQTT_URL: mqtt://mosquitto:1883
-      EDGE_ZONE: B
-      EDGE_RACK: B1
-      EXECUTOR_ID: executor-B1
-      ACK_DELAY_MS: 500
-      ACK_MODE: ACKED
-
-  edge-collector-b1:
-    build:
-      context: ./edge-collector
-      dockerfile: Dockerfile
-    container_name: sedcm-edge-collector-b1
-    depends_on:
-      mosquitto:
-        condition: service_healthy
-    environment:
-      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
       EDGE_ZONE: B
       EDGE_RACK: B1
       NODE_ID: N3
-      COLLECTOR_ID: collector-B1
-      NODE_INTERVAL_MS: 5000
-      ENV_INTERVAL_MS: 10000
-      SCENARIO: warning
+      EXECUTOR_ID: executor-B1
+      NODE_INTERVAL_S: 5
+      ENV_INTERVAL_S: 10
+      ACK_DELAY_S: 0.5
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
-  edge-executor-b2:
+  edge-agent-b2:
     build:
-      context: ./edge-executor
+      context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-executor-b2
+    container_name: sedcm-edge-agent-b2
     depends_on:
       mosquitto:
         condition: service_healthy
     environment:
-      MQTT_URL: mqtt://mosquitto:1883
-      EDGE_ZONE: B
-      EDGE_RACK: B2
-      EXECUTOR_ID: executor-B2
-      ACK_DELAY_MS: 500
-      ACK_MODE: ACKED
-
-  edge-collector-b2:
-    build:
-      context: ./edge-collector
-      dockerfile: Dockerfile
-    container_name: sedcm-edge-collector-b2
-    depends_on:
-      mosquitto:
-        condition: service_healthy
-    environment:
-      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
       EDGE_ZONE: B
       EDGE_RACK: B2
       NODE_ID: N4
-      COLLECTOR_ID: collector-B2
-      NODE_INTERVAL_MS: 5000
-      ENV_INTERVAL_MS: 10000
-      SCENARIO: critical_environment
+      EXECUTOR_ID: executor-B2
+      NODE_INTERVAL_S: 5
+      ENV_INTERVAL_S: 10
+      ACK_DELAY_S: 0.5
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   pgdata:

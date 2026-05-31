@@ -2,13 +2,13 @@
 
 Este archivo provee orientación a Claude Code (claude.ai/code) al trabajar con el código de este repositorio.
 
-## Descripción del Proyecto
+## Descripción del Proyecto y Misión
 
-**SEDCM** (Smart Edge Data Center Manager) es un sistema distribuido de grado industrial para el monitoreo y control automatizado de infraestructura crítica de datacenter. Procesa telemetría de nodos y ambiente, evalúa umbrales mediante un motor de reglas, despacha comandos de mitigación y visualiza el estado en tiempo real en un dashboard React.
+**SEDCM** (Smart Edge Data Center Manager) es un sistema distribuido de grado industrial (IoT / Edge Computing) para el monitoreo y control automatizado de infraestructura crítica. El sistema procesa la telemetría simulada (CPU, RAM, Red, Temperatura y Humedad) generada en los nodos de borde (Edge Nodes). El "Cerebro" (Motor de Reglas en Node.js) evalúa esta telemetría contra umbrales predefinidos, despacha comandos de mitigación de forma autónoma (ej. reinicios o ajustes de HVAC) y actualiza el estado en tiempo real en un Dashboard React (Near Real-Time).
 
-> **Regla de Oro:** El sistema es 100% asíncrono y desacoplado. El Backend y los Nodos de Borde **NUNCA** se comunican directamente por HTTP. Toda comunicación pasa obligatoriamente por el Broker MQTT.
+> **Regla de Oro de la Arquitectura:** El sistema es 100% asíncrono y desacoplado. El Backend y los Nodos de Borde NUNCA se comunican directamente por HTTP; toda la comunicación bidireccional (Telemetría, Control y Acuses de Recibo) pasa obligatoriamente por el Broker MQTT.
 
-> **Actuadores automáticos:** El sistema dispara todos los actuadores (HVAC: cooling/humidify/dehumidify; soft_reboot; hard_shutdown) automáticamente por el motor de reglas. El usuario solo monitorea — no hay controles manuales de HVAC ni ambiente en la UI.
+> **Autonomía y Control Manual Seguro:** El Motor de Reglas central dispara las mitigaciones (ej. `soft_reboot`, `hard_shutdown`, `set_hvac_mode`) de forma automática al detectar anomalías. Sin embargo, el Dashboard Web (React) provee una interfaz para que el operador emita comandos manuales hacia el borde para recuperar servicios. Específicamente, el sistema cuenta con un botón de **"Recuperar Nodo"** (que envía el comando `start_node`). Toda intervención manual está sujeta a bloqueos de seguridad cruzados: este botón solo se habilitará en la UI si el nodo está en estado `OFFLINE` **y** la temperatura actual de su rack es ≤ 42°C.
 
 ---
 
@@ -47,10 +47,17 @@ docker compose logs -f edge-collector-a1
 
 ### Capa de Borde (Edge — Python)
 
-- `Aplicacion/edge-agent/collector.py` — Publica telemetría de nodo y ambiente en MQTT. Acepta variable `SCENARIO`: `normal`, `warning`, `critical_node`, `critical_environment`.
-- `Aplicacion/edge-agent/executor.py` — Suscribe a `dc/control/zona/{Z}/rack/{R}`, ejecuta comandos Docker y publica ACK + efectos de actuador.
-- Los simuladores Node.js en `edge-collector/` y `edge-executor/` siguen activos en Docker para desarrollo.
-
+- **Ubicación:** Directorio `Aplicacion/edge-agent/` (Diseñado como repositorio independiente para despliegue distribuido).
+- **Lenguaje:** Estrictamente Python. (Cualquier simulador heredado en Node.js en la capa de borde queda depreciado).
+- **`collector.py` (Agente de Ingesta):** Extrae la carga (CPU/RAM) y la termodinámica del rack. Publica constantemente en `dc/telemetria/#`. Utiliza un modelo híbrido determinista (no 100% aleatorio) para forzar estados críticos en la demostración.
+    - **Regla Termodinámica (Inercia):** El ciclo de vida del nodo es independiente del rack. Si un contenedor se apaga (`hard_shutdown`), la telemetría del nodo afectado se detiene (o reporta 0), pero la telemetría del `ambiente` (Temperatura/Humedad) DEBE continuar publicándose ininterrumpidamente, simulando un enfriamiento progresivo.
+- **`executor.py` (Actuador Directo):** Suscrito a `dc/control/zona/{Z}/rack/{R}`. Traduce comandos estructurados en acciones hacia la simulación o la API local de Docker:
+    - `soft_reboot`: Reinicia variables lógicas simuladas a un estado base (15%).
+    - `hard_shutdown`: Ejecuta `docker stop` al contenedor real.
+    - `start_node`: Ejecuta `docker start` al contenedor y resetea la simulación para que el nodo despierte "sano" (CPU/RAM base).
+    - `set_hvac_mode`: Altera la fórmula de enfriamiento ambiental.
+    - **Importante:** Las acciones de mitigación se aplican *localmente* en el host. El tópico `dc/actuator/#` no debe utilizarse para bucles internos; tras ejecutar la acción, el executor publica un `ACK` directo al Backend.
+    
 ### Capa Middleware
 
 Broker MQTT Eclipse Mosquitto 2, puerto `1883` (sin TLS en desarrollo).
@@ -91,7 +98,6 @@ Ver contratos completos en `docs/SEDCM_CONTEXT.md`.
 | `dc/telemetria/zona/{Z}/rack/{R}/ambiente` | Edge Collector | Backend |
 | `dc/control/zona/{Z}/rack/{R}` | Backend | Edge Executor |
 | `dc/ack/zona/{Z}/rack/{R}` | Edge Executor | Backend |
-| `dc/actuator/{Z}/{R}` | Edge Executor | Edge Collector |
 
 ---
 

@@ -154,6 +154,51 @@ body{margin:0;font-family:Inter,ui-sans-serif,system-ui,Arial;background:var(--b
 .chart-wrap:hover svg .chart-line{filter:drop-shadow(0 6px 16px rgba(102,217,239,0.06))}
 
 @keyframes slideUp{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
+
+/* ── Estado OFFLINE de nodo ───────────────────────────────────────────────── */
+.server-card.server-offline{
+  border-color:rgba(231,76,60,0.3);
+  background:linear-gradient(180deg,rgba(231,76,60,0.05),transparent);
+}
+.offline-banner{
+  display:flex;align-items:center;gap:10px;
+  margin:4px 0 8px 0;
+}
+.offline-badge{
+  display:inline-block;font-size:11px;font-weight:700;letter-spacing:.06em;
+  color:var(--danger);background:rgba(231,76,60,0.14);
+  border:1px solid rgba(231,76,60,0.3);
+  padding:2px 8px;border-radius:4px;
+}
+.offline-temp-warn{
+  font-size:11px;color:var(--warn);opacity:0.85;
+}
+.metric-offline{
+  color:rgba(231,76,60,0.55);
+}
+.offline-chart-note{
+  font-size:12px;color:var(--warn);opacity:0.8;
+  margin:6px 0 2px 0;font-style:italic;
+}
+
+/* ── Botón Recuperar Nodo ────────────────────────────────────────────────── */
+.recover-btn{
+  background:transparent;
+  border:1px solid rgba(39,174,96,0.35);
+  color:var(--ok);
+  padding:5px 10px;border-radius:6px;
+  font-size:12px;font-weight:600;cursor:pointer;
+  transition:background .12s ease, box-shadow .12s ease;
+}
+.recover-btn:hover:not(:disabled){
+  background:rgba(39,174,96,0.12);
+  box-shadow:0 4px 14px rgba(39,174,96,0.08);
+}
+.recover-btn:disabled{
+  opacity:0.28;cursor:not-allowed;
+  border-color:rgba(255,255,255,0.07);
+  color:var(--muted);
+}
 .linechart{position:relative}
 .chart-tooltip{position:absolute;transform:translate(-50%,-100%);background:rgba(2,6,9,0.9);padding:8px 10px;border-radius:6px;border:1px solid rgba(102,217,239,0.08);color:#e6eef3;font-size:12px;pointer-events:none;white-space:nowrap}
 .chart-tooltip .tt-time{font-size:11px;color:var(--muted);margin-bottom:4px}

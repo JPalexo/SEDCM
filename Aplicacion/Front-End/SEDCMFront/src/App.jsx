@@ -58,7 +58,7 @@ function eventToLog(event) {
   const t = Date.now()
 
   if (type === 'node_status_changed') {
-    const level = data.new_status === 'Critico' ? 'critical' : data.new_status === 'Warning' ? 'warn' : 'info'
+    const level = data.new_status === 'Critico' || data.new_status === 'OFFLINE' ? 'critical' : data.new_status === 'Warning' ? 'warn' : 'info'
     return { t, level, text: `[${data.zone_code}/${data.rack_code}] ${data.node_id}: estado → ${data.new_status}` }
   }
   if (type === 'rack_status_changed') {
@@ -210,6 +210,11 @@ export default function App() {
                   ...r,
                   servers: r.servers.map(s => {
                     const merged = { ...s.metrics, ...envMetrics }
+                    // Nodo OFFLINE: actualiza temp/humidity para el indicador de HVAC y el botón
+                    // de recuperación, pero NO agrega puntos al historial (evita trazar línea congelada)
+                    if (s.health_status === 'OFFLINE') {
+                      return { ...s, metrics: merged }
+                    }
                     const history = [...(s.metricsHistory || []), { ...merged, t: Date.now() }].slice(-60)
                     return { ...s, metrics: merged, metricsHistory: history }
                   })
@@ -229,9 +234,18 @@ export default function App() {
                 if (r.rack_code !== data.rack_code) return r
                 return {
                   ...r,
-                  servers: r.servers.map(s =>
-                    s.id === data.node_id ? { ...s, health_status: data.new_status } : s
-                  )
+                  servers: r.servers.map(s => {
+                    if (s.id !== data.node_id) return s
+                    const base = { ...s, health_status: data.new_status }
+                    // Al pasar a OFFLINE: zerear cpu/ram/net y agregar punto final al historial
+                    // para que la gráfica muestre la caída antes de detenerse
+                    if (data.new_status === 'OFFLINE') {
+                      const zeroedMetrics = { ...s.metrics, cpu: 0, ram: 0, net: 0 }
+                      base.metrics = zeroedMetrics
+                      base.metricsHistory = [...(s.metricsHistory || []), { ...zeroedMetrics, t: Date.now() }].slice(-60)
+                    }
+                    return base
+                  })
                 }
               })
             }
@@ -408,6 +422,7 @@ export default function App() {
             <RackDetail
               rack={zones.flatMap(z => z.racks).find(r => r.id === selectedRack.id) || selectedRack}
               onBack={() => setSelectedRack(null)}
+              onCommand={sendCommand}
             />
           )}
         </main>

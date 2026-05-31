@@ -15,7 +15,7 @@ const PENDING_DEDUP_WINDOW_SECONDS = 300;
 const RECENT_NODE_COMMAND_WINDOW_SECONDS = 300;
 const DEFAULT_NODE_ESCALATION_GRACE_MS = 30000;
 
-type CommandAction = "soft_reboot" | "hard_shutdown" | "set_hvac_mode";
+type CommandAction = "soft_reboot" | "hard_shutdown" | "set_hvac_mode" | "start_node";
 type CommandTargetType = "nodo" | "rack";
 
 export type CommandDescriptor = {

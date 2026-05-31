@@ -6,7 +6,7 @@ export type CommandAuditRecord = {
   rackCode: string;
   nodeId: string | null;
   targetType: "nodo" | "rack";
-  action: "soft_reboot" | "hard_shutdown" | "set_hvac_mode";
+  action: "soft_reboot" | "hard_shutdown" | "set_hvac_mode" | "start_node";
   reason: string;
   mqttTopic: string;
   payload: Record<string, unknown>;
@@ -29,7 +29,7 @@ export async function hasRecentPendingCommand(args: {
   rackCode: string;
   nodeId: string | null;
   targetType: "nodo" | "rack";
-  action: "soft_reboot" | "hard_shutdown" | "set_hvac_mode";
+  action: "soft_reboot" | "hard_shutdown" | "set_hvac_mode" | "start_node";
   reason: string;
   windowSeconds: number;
 }): Promise<boolean> {

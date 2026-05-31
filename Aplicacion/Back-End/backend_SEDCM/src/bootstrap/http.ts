@@ -21,7 +21,7 @@ type CorsConfig = {
   allowedOriginsSet: Set<string>;
 };
 
-type ManualCommandAction = "soft_reboot" | "hard_shutdown" | "set_hvac_mode";
+type ManualCommandAction = "soft_reboot" | "hard_shutdown" | "set_hvac_mode" | "start_node";
 type ManualCommandTargetType = "nodo" | "rack";
 
 type ManualCommandBody = {
@@ -163,13 +163,14 @@ function validateManualCommandBody(payload: unknown): ManualCommandBody {
   if (
     action !== "soft_reboot" &&
     action !== "hard_shutdown" &&
-    action !== "set_hvac_mode"
+    action !== "set_hvac_mode" &&
+    action !== "start_node"
   ) {
     throw new Error("invalid_action");
   }
 
-  if (action === "soft_reboot" && targetType !== "nodo") {
-    throw new Error("soft_reboot_requires_nodo");
+  if ((action === "soft_reboot" || action === "start_node") && targetType !== "nodo") {
+    throw new Error(`${action}_requires_nodo`);
   }
 
   if (action === "set_hvac_mode") {
