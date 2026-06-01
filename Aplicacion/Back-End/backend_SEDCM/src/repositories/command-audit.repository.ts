@@ -15,7 +15,7 @@ export type CommandAuditRecord = {
 
 export type CommandAckStatus = "ACKED" | "FAILED";
 export type AuditCommandStatus = "PENDING" | "ACKED" | "FAILED";
-export type NodeAction = "soft_reboot" | "hard_shutdown";
+export type NodeAction = "soft_reboot" | "hard_shutdown" | "start_node";
 
 export type RecentNodeCommand = {
   commandId: string;

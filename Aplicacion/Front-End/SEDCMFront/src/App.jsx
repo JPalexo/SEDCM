@@ -91,6 +91,8 @@ export default function App() {
   const [logs, setLogs] = useState([])
   // Mapa rackKey → último modo HVAC conocido, actualizado por eventos command_published
   const [hvacModeByRack, setHvacModeByRack] = useState({})
+  // Nodos con start_node en vuelo — se limpian al recibir node_status_changed a estado activo
+  const [recoveringNodes, setRecoveringNodes] = useState(new Set())
 
   const wsRef = useRef(null)
   const zonesRef = useRef(zones)
@@ -110,8 +112,11 @@ export default function App() {
       const data = await res.json()
       if (res.ok) {
         pushLog({ t: Date.now(), level: 'info', text: `Comando '${action}' despachado → ${String(data.command_id).slice(0, 8)}…` })
+        if (action === 'start_node') {
+          setRecoveringNodes(prev => new Set([...prev, target_id]))
+        }
       } else {
-        pushLog({ t: Date.now(), level: 'warn', text: `Error al despachar '${action}': ${data.detail || res.status}` })
+        pushLog({ t: Date.now(), level: 'warn', text: `Error al despachar '${action}': ${data.detail || data.error || res.status}` })
       }
     } catch (e) {
       pushLog({ t: Date.now(), level: 'warn', text: `Error de red al despachar '${action}': ${e.message}` })
@@ -226,6 +231,16 @@ export default function App() {
 
         // Actualizar health_status del nodo
         if (type === 'node_status_changed') {
+          // Si el nodo sale de OFFLINE, ya no está en proceso de recuperación
+          if (data.new_status !== 'OFFLINE') {
+            setRecoveringNodes(prev => {
+              if (!prev.has(data.node_id)) return prev
+              const next = new Set(prev)
+              next.delete(data.node_id)
+              return next
+            })
+          }
+
           setZones(prev => prev.map(z => {
             if (z.zone_code !== data.zone_code) return z
             return {
@@ -423,6 +438,7 @@ export default function App() {
               rack={zones.flatMap(z => z.racks).find(r => r.id === selectedRack.id) || selectedRack}
               onBack={() => setSelectedRack(null)}
               onCommand={sendCommand}
+              recoveringNodes={recoveringNodes}
             />
           )}
         </main>

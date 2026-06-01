@@ -9,7 +9,7 @@ const METRICS = [
   { key: 'net',      label: 'Red'     },
 ]
 
-export default function RackDetail({ rack, onBack, onCommand }) {
+export default function RackDetail({ rack, onBack, onCommand, recoveringNodes = new Set() }) {
   const [metric, setMetric] = useState('cpu')
   const [expandedServer, setExpandedServer] = useState(null)
 
@@ -44,7 +44,8 @@ export default function RackDetail({ rack, onBack, onCommand }) {
       <div className="servers-grid">
         {rack.servers.map(s => {
           const isOffline = s.health_status === 'OFFLINE'
-          const canRecover = isOffline && rackAmbientTemp <= 42
+          const isRecovering = recoveringNodes.has(s.id)
+          const canRecover = isOffline && rackAmbientTemp <= 42 && !isRecovering
 
           return (
             <div key={s.id} className={`server-card${isOffline ? ' server-offline' : ''}`}>
@@ -59,13 +60,15 @@ export default function RackDetail({ rack, onBack, onCommand }) {
                       className="recover-btn"
                       disabled={!canRecover}
                       title={
-                        canRecover
+                        isRecovering
+                          ? 'Comando de recuperación en progreso — esperando confirmación del nodo'
+                          : canRecover
                           ? 'Enviar comando start_node al nodo'
                           : `Rack a ${rackAmbientTemp.toFixed(1)}°C — espera enfriamiento (≤ 42°C)`
                       }
                       onClick={() => handleRecover(s)}
                     >
-                      Recuperar Nodo
+                      {isRecovering ? 'Recuperando…' : 'Recuperar Nodo'}
                     </button>
                   )}
                   <button

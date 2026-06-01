@@ -13,6 +13,7 @@ import {
   fetchRacks,
   normalizeLimit
 } from "../repositories/query.repository";
+import { hasRecentNodeCommandByStatuses } from "../repositories/command-audit.repository";
 import { startWebSocketServer } from "../realtime/ws-server";
 
 type CorsConfig = {
@@ -260,6 +261,36 @@ async function handleManualCommandRequest(args: {
     );
     sendError(args.req, args.res, args.cors, 503, "mqtt_unavailable");
     return;
+  }
+
+  // Protección anti-spam: rechaza start_node duplicado en ventana de 30 s
+  if (validatedBody.action === "start_node") {
+    const alreadyPending = await hasRecentNodeCommandByStatuses({
+      nodeId: validatedBody.target_id,
+      action: "start_node",
+      statuses: ["PENDING"],
+      windowSeconds: 30
+    });
+
+    if (alreadyPending) {
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          event: "manual_command_rejected",
+          cause: "start_node_already_pending",
+          node_id: validatedBody.target_id
+        })
+      );
+      sendError(
+        args.req,
+        args.res,
+        args.cors,
+        409,
+        "command_already_pending",
+        "Ya existe un comando start_node pendiente para este nodo. Espera el acuse de recibo."
+      );
+      return;
+    }
   }
 
   try {
