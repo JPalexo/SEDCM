@@ -1,0 +1,3 @@
+[submodule "Aplicacion/edge-agent"]
+	path = Aplicacion/edge-agent
+	url = https://github.com/JPalexo/sedcm-edge-agent.git

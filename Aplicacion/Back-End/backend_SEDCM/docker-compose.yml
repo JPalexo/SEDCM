@@ -71,11 +71,11 @@ services:
       retries: 10
       start_period: 15s
 
-  edge-agent-a1:
+  edge-agent-a1-n1:
     build:
       context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-agent-a1
+    container_name: sedcm-edge-agent-a1-n1
     depends_on:
       mosquitto:
         condition: service_healthy
@@ -85,18 +85,39 @@ services:
       EDGE_ZONE: A
       EDGE_RACK: A1
       NODE_ID: N1
-      EXECUTOR_ID: executor-A1
+      EXECUTOR_ID: executor-A1-N1
       NODE_INTERVAL_S: 5
       ENV_INTERVAL_S: 10
       ACK_DELAY_S: 0.5
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
-  edge-agent-a2:
+  edge-agent-a1-n2:
     build:
       context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-agent-a2
+    container_name: sedcm-edge-agent-a1-n2
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+      EDGE_ZONE: A
+      EDGE_RACK: A1
+      NODE_ID: N2
+      EXECUTOR_ID: executor-A1-N2
+      NODE_INTERVAL_S: 5
+      ENV_INTERVAL_S: 10
+      ACK_DELAY_S: 0.5
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  edge-agent-a2-n3:
+    build:
+      context: ../../edge-agent
+      dockerfile: Dockerfile
+    container_name: sedcm-edge-agent-a2-n3
     depends_on:
       mosquitto:
         condition: service_healthy
@@ -105,50 +126,29 @@ services:
       MQTT_PORT: 1883
       EDGE_ZONE: A
       EDGE_RACK: A2
-      NODE_ID: N2
-      EXECUTOR_ID: executor-A2
-      NODE_INTERVAL_S: 5
-      ENV_INTERVAL_S: 10
-      ACK_DELAY_S: 0.5
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-
-  edge-agent-b1:
-    build:
-      context: ../../edge-agent
-      dockerfile: Dockerfile
-    container_name: sedcm-edge-agent-b1
-    depends_on:
-      mosquitto:
-        condition: service_healthy
-    environment:
-      MQTT_HOST: mosquitto
-      MQTT_PORT: 1883
-      EDGE_ZONE: B
-      EDGE_RACK: B1
       NODE_ID: N3
-      EXECUTOR_ID: executor-B1
+      EXECUTOR_ID: executor-A2-N3
       NODE_INTERVAL_S: 5
       ENV_INTERVAL_S: 10
       ACK_DELAY_S: 0.5
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
-  edge-agent-b2:
+  edge-agent-a2-n4:
     build:
       context: ../../edge-agent
       dockerfile: Dockerfile
-    container_name: sedcm-edge-agent-b2
+    container_name: sedcm-edge-agent-a2-n4
     depends_on:
       mosquitto:
         condition: service_healthy
     environment:
       MQTT_HOST: mosquitto
       MQTT_PORT: 1883
-      EDGE_ZONE: B
-      EDGE_RACK: B2
+      EDGE_ZONE: A
+      EDGE_RACK: A2
       NODE_ID: N4
-      EXECUTOR_ID: executor-B2
+      EXECUTOR_ID: executor-A2-N4
       NODE_INTERVAL_S: 5
       ENV_INTERVAL_S: 10
       ACK_DELAY_S: 0.5

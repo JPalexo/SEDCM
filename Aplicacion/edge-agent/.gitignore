@@ -1,9 +1,0 @@
-# Variables de entorno con IP real del servidor (no subir al repo)
-config.env
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
