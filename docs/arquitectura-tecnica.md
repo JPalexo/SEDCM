@@ -547,3 +547,70 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
 | Estado global del dashboard | `Aplicacion/Front-End/SEDCMFront/src/App.jsx` |
 | Estilos y colores del dashboard | `Aplicacion/Front-End/SEDCMFront/src/styles.css` |
 | Esquema de la base de datos | `Aplicacion/Back-End/backend_SEDCM/db/schema.md` |
+
+---
+
+## 10. Topología distribuida LAN y bugs resueltos (2026-06-01)
+
+### 10.1 Topología final
+
+El sistema opera en red LAN con dos tipos de nodos:
+
+**Servidor Central (PC de Alejandro)**
+
+Levanta 7 servicios con `docker compose up --build` desde `Aplicacion/Back-End/backend_SEDCM/`:
+
+| Servicio | Descripción |
+|---|---|
+| `sedcm-postgres` | PostgreSQL 16 |
+| `sedcm-mosquitto` | Eclipse Mosquitto 2, escucha en `0.0.0.0:1883` |
+| `sedcm-backend` | Node.js/TypeScript, expuesto en `0.0.0.0:3000` |
+| `sedcm-edge-agent-a1-n1` | Zona A, Rack A1, Nodo N1 |
+| `sedcm-edge-agent-a1-n2` | Zona A, Rack A1, Nodo N2 |
+| `sedcm-edge-agent-a2-n3` | Zona A, Rack A2, Nodo N3 |
+| `sedcm-edge-agent-a2-n4` | Zona A, Rack A2, Nodo N4 |
+
+**PC Invitada (compañeros de clase)**
+
+Clonan el repositorio standalone `JPalexo/sedcm-edge-agent`, crean un `.env` con `MQTT_HOST=<IP_LAN>` y `EDGE_ZONE=B` (o C, D…) y ejecutan `docker compose up --build -d`. Esto levanta 4 contenedores que aparecen como una nueva zona en el dashboard.
+
+`Aplicacion/edge-agent/` en el monorepo es un Git Submodule que apunta a `JPalexo/sedcm-edge-agent`.
+
+### 10.2 Bug resuelto — Fan-out de comandos MQTT
+
+**Síntoma:** Con 2 nodos por rack, un `hard_shutdown` para N1 también silenciaba a N2. Ambos racks de la Zona A aparecían como "fantasmas" (0.0°C, sin nodos).
+
+**Causa raíz:** Todos los agentes de un rack suscriben al mismo tópico de control `dc/control/zona/{Z}/rack/{R}`. El `_ejecutar_comando` de `agent.py` no verificaba si el comando era para su propio `NODO_ID`, ejecutando `_set_node_shutdown(True)` en todos los nodos del rack indiscriminadamente. Además, `_docker_stop(target_id)` usaba el `node_id` (ej. `"N1"`) como nombre de contenedor Docker, pero el nombre real es `sedcm-edge-agent-a1-n1`, lo que hacía que el stop siempre fallara silenciosamente.
+
+**Fix en `agent.py`:**
+```python
+# Nombre real del contenedor (ej. sedcm-edge-a1-n1)
+MY_CONTAINER_NAME = f"sedcm-edge-{RACK_ID.lower()}-{NODO_ID.lower()}"
+
+# Guardia en _ejecutar_comando: ignorar comandos de nodo dirigidos a otro nodo
+NODE_LEVEL_ACTIONS = {"soft_reboot", "hard_shutdown", "start_node"}
+if action in NODE_LEVEL_ACTIONS and target_type == "nodo" and target_id != NODO_ID:
+    print(f"[IGNORADO] '{action}' para '{target_id}' — este nodo es '{NODO_ID}'")
+    return
+```
+
+### 10.3 Bug resuelto — Colisión de clave primaria en PostgreSQL
+
+**Síntoma:** Al conectar una Zona B con NODE_IDs N1-N4, los racks de Zona B aparecían vacíos y los de Zona A perdían sus nodos intermitentemente.
+
+**Causa raíz:** El repositorio de telemetría usa `ON CONFLICT (node_id)` con `node_id` como única clave (sin incluir zona ni rack). Cuando Zona B publicaba telemetría con `node_id=N1`, el `ON CONFLICT` actualizaba la fila existente de Zona A, reasignando N1 de la Zona A a la Zona B. Las dos zonas se "robaban" los nodos ciclo a ciclo.
+
+**Fix en `edge-agent/docker-compose.yml`:** Los NODE_IDs del compose standalone llevan prefijo de zona:
+
+```yaml
+NODE_ID: ${EDGE_ZONE:-B}N1   # → BN1 con EDGE_ZONE=B, CN1 con EDGE_ZONE=C
+```
+
+La Zona A (servidor central) conserva N1-N4. Cada zona invitada usa IDs únicos globalmente (BN1-BN4, CN1-CN4, etc.).
+
+### 10.4 Convención de nombres
+
+| Ubicación | Patrón `container_name` | Patrón `NODE_ID` | Ejemplo |
+|---|---|---|---|
+| Servidor (Zona A) | `sedcm-edge-agent-{rack}-{nodo}` | `N{n}` | `sedcm-edge-agent-a1-n1` / `N1` |
+| Standalone invitado | `sedcm-edge-{ZONE}{rack_num}-n{n}` | `{ZONE}N{n}` | `sedcm-edge-B1-n1` / `BN1` |
