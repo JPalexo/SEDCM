@@ -15,40 +15,49 @@
 
 Esta decisión de diseño garantiza desacoplamiento total: si el backend cae, los nodos siguen publicando; si un nodo cae, el backend lo detecta por ausencia de telemetría.
 
+### Autonomía y Control Manual Seguro
+
+El Motor de Reglas dispara mitigaciones automáticas. Adicionalmente, el Dashboard Web provee el botón **"Recuperar Nodo"** para que el operador emita el comando `start_node` manualmente. Este botón está sujeto a **bloqueos de seguridad cruzados de doble capa**:
+
+- **Capa 1 — Frontend (React):** el botón solo se habilita si `health_status === 'OFFLINE'` **Y** la temperatura ambiental del rack es `≤ 42°C` **Y** no hay ya un comando de recuperación en vuelo (`!isRecovering`).
+- **Capa 2 — Backend (HTTP 409):** antes de publicar el comando en MQTT, el servidor verifica en PostgreSQL que no exista un `start_node` con estado `PENDING` para ese nodo en los últimos 30 segundos. Si existe, rechaza la petición con HTTP 409 Conflict.
+
 ---
 
 ## 2. Arquitectura General
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  CAPA EDGE (Python)                                     │
-│  collector.py  ──publica telemetría──►                  │
-│  executor.py   ◄──recibe comandos──  ──publica ACK──►   │
+│  CAPA EDGE (Python — agent.py unificado)                │
+│  Colector + Ejecutor + Emulación física en un proceso   │
+│  ──publica telemetría──►   ◄──recibe comandos──         │
+│  ──publica ACK──►                                       │
 └────────────────────────┬────────────────────────────────┘
                          │ MQTT (puerto 1883)
 ┌────────────────────────▼────────────────────────────────┐
 │  BROKER MQTT — Eclipse Mosquitto 2                      │
-│  Enruta mensajes entre Edge ↔ Backend                   │
+│  Escucha en 0.0.0.0:1883 (accesible desde toda la LAN) │
 └────────────────────────┬────────────────────────────────┘
                          │ MQTT
 ┌────────────────────────▼────────────────────────────────┐
 │  BACKEND — Control Plane (Node.js / TypeScript)         │
 │  Ingesta → Validación → Reglas → Comandos → WebSocket   │
-│  API REST: http://localhost:3000                        │
-│  WebSocket: ws://localhost:3000/ws                      │
+│  API REST: http://0.0.0.0:3000                          │
+│  WebSocket: ws://0.0.0.0:3000/ws                        │
 └──────────────┬──────────────────────┬───────────────────┘
-               │ REST + WebSocket      │
-┌──────────────▼──────────────────────▼───────────────────┐
-│  FRONTEND — Dashboard React (Vite, puerto 5173)         │
-│  Monitoreo en tiempo real del estado del datacenter     │
-└─────────────────────────────────────────────────────────┘
+               │ REST + WebSocket      │ SQL
+        ┌──────▼──────┐        ┌──────▼──────┐
+        │  FRONTEND   │        │ PostgreSQL  │
+        │  React/Vite │        │  Puerto 5432│
+        │  Puerto 5173│        └─────────────┘
+        └─────────────┘
 ```
 
 ### Tecnologías por capa
 
 | Capa | Tecnología principal | Puerto |
 |---|---|---|
-| Edge | Python 3.10+, paho-mqtt 2 | — |
+| Edge | Python 3.10+, paho-mqtt 2.x | — |
 | Broker MQTT | Eclipse Mosquitto 2 | 1883 |
 | Backend | Node.js 20, TypeScript, pg (PostgreSQL) | 3000 |
 | Base de datos | PostgreSQL 16 | 5432 |
@@ -56,69 +65,116 @@ Esta decisión de diseño garantiza desacoplamiento total: si el backend cae, lo
 
 ---
 
-## 3. Capa Edge — Agente Python
+## 3. Capa Edge — Agente Python Unificado
 
-**Directorio:** `Aplicacion/edge-agent/`
+**Directorio:** `Aplicacion/edge-agent/` (Git Submodule → `JPalexo/sedcm-edge-agent`)
 
-El agente edge simula o representa los dispositivos físicos del datacenter. Está compuesto por tres módulos Python independientes.
+### 3.1 Transición a microservicio unificado: `agent.py`
 
-### 3.1 `emuladores.py` — Simuladores de física
+La arquitectura inicial separaba la colección de telemetría (`collector.py`) de la ejecución de comandos (`executor.py`), comunicándolos a través de un tópico MQTT interno `dc/actuator/`. Esta separación fue reemplazada por un **proceso unificado `agent.py`** que consolida ambas responsabilidades.
 
-Define las clases que modelan el comportamiento de los dispositivos con inercia y realismo.
+**Ventaja clave:** Los comandos del backend actúan **directamente sobre los objetos de emulación en memoria** (instancias de `NodeEmulator` y `EnvironmentSimulator`), eliminando la latencia del round-trip por MQTT interno y el punto de fallo del tópico `dc/actuator/`.
+
+```
+Arquitectura anterior (dos procesos):
+  Backend ─MQTT control─► executor.py ─MQTT actuator─► collector.py
+
+Arquitectura actual (proceso unificado):
+  Backend ─MQTT control─► agent.py ──── acceso directo a objeto nodo/rack
+                                   └──► publica ACK directo al Backend
+```
+
+El proceso `agent.py` expone un único loop principal con tres responsabilidades:
+
+| Responsabilidad | Frecuencia | Función |
+|---|---|---|
+| Publicar telemetría de nodo | Cada `NODE_INTERVAL_S` s (default: 5 s) | `publicar_nodo()` |
+| Publicar telemetría ambiental del rack | Cada `ENV_INTERVAL_S` s (default: 10 s) | `publicar_ambiente()` |
+| Ejecutar comandos del backend | Reactivo (al recibir mensaje MQTT) | `_ejecutar_comando()` |
+
+Los comandos se procesan en **hilos separados** (`threading.Thread`) para no bloquear el loop MQTT mientras se ejecutan operaciones de Docker o esperas de ACK.
+
+---
+
+### 3.2 `emuladores.py` — Simuladores de física del rack
+
+Importado por `agent.py`. Define las clases que modelan el comportamiento de los dispositivos con inercia y realismo.
 
 **`NodeEmulator`**
-- Emula un nodo de cómputo (servidor). Mantiene estado de CPU%, RAM MB y tráfico de red.
-- Implementa "fugas de recursos": con 5% de probabilidad en cada ciclo, el nodo comienza a degradarse gradualmente (CPU sube, RAM aumenta).
-- Soporta recuperación espontánea (1% de probabilidad) o forzada por el método `soft_reboot()`, que resetea el estado a valores saludables.
+- Emula un nodo de cómputo (servidor). Mantiene estado de CPU %, RAM MB y tráfico de red.
+- Implementa "fugas de recursos": con 5 % de probabilidad en cada ciclo, el nodo comienza a degradarse (CPU sube, RAM aumenta).
+- Soporta recuperación espontánea (1 % de probabilidad) o forzada por `soft_reboot()`, que resetea CPU y RAM a valores saludables (~15 %).
 - `get_payload()` genera el JSON de telemetría listo para publicar por MQTT.
+- La propiedad `is_leaking` indica si el nodo está en modo de degradación activa (se marca en el log del agente).
 
 **`EnvironmentSimulator`**
 - Emula el ambiente térmico de un rack. Mantiene temperatura °C y humedad %.
-- La temperatura objetivo se calcula en función de la carga CPU promedio del rack (a más carga, más calor).
-- Modos HVAC: `off`, `cooling`, `humidify`, `dehumidify`. Cada modo ajusta el destino térmico del simulador.
-- `set_hvac_mode(modo)` permite al executor cambiar el modo cuando recibe un comando del backend.
+- La temperatura objetivo se calcula en función de la carga CPU efectiva del rack.
+- Modos HVAC: `off`, `cooling`, `humidify`, `dehumidify`. Cada modo desplaza la temperatura/humedad objetivo.
+- `set_hvac_mode(modo)` permite al `_ejecutar_comando` cambiar el modo cuando recibe un `set_hvac_mode`.
 
-**`build_seeded_rng()`** — Crea un generador de números aleatorios determinístico usando la variable `SIM_SEED` (útil para pruebas reproducibles).
-
----
-
-### 3.2 `collector.py` — Publicador de telemetría
-
-Es el proceso que corre continuamente publicando métricas al broker MQTT y reaccionando a efectos de actuadores.
-
-**Flujo principal:**
-1. Conecta al broker MQTT con credenciales de entorno.
-2. Se suscribe a `dc/actuator/zona/{Z}/rack/{R}` para recibir efectos.
-3. En cada ciclo publica:
-   - Telemetría del nodo en `dc/telemetria/zona/{Z}/rack/{R}/nodo/{N}` (cada `NODE_INTERVAL_S` segundos)
-   - Telemetría ambiental en `dc/telemetria/zona/{Z}/rack/{R}/ambiente` (cada `ENV_INTERVAL_S` segundos)
-
-**Efectos de actuadores (recibidos por `dc/actuator/`):**
-
-| Efecto | Duración | Acción en el simulador |
-|---|---|---|
-| `cpu_cooldown` | 30 s | Aplica `soft_reboot()` en el nodo |
-| `node_shutdown` | 45 s | Silencia la publicación de telemetría del nodo |
-| `environment_cooling` | 45 s | Cambia el modo HVAC del simulador |
+**`build_seeded_rng()`** — Crea un generador de números aleatorios determinístico usando `SIM_SEED`. Ambas instancias (`nodo` y `rack`) comparten el mismo RNG para comportamiento reproducible.
 
 ---
 
-### 3.3 `executor.py` — Ejecutor de comandos
+### 3.3 Inercia Térmica — Principio del Ciclo de Vida Independiente
 
-Escucha los comandos que el backend publica y los ejecuta. Luego informa el resultado.
+> **Regla de diseño:** El ciclo de vida del nodo de cómputo es independiente del ciclo de vida del rack ambiental.
 
-**Flujo por comando recibido:**
-1. Recibe mensaje en `dc/control/zona/{Z}/rack/{R}` con payload JSON `{command_id, action, ...}`.
-2. Ejecuta la acción:
-   - `soft_reboot`: pausa 2 segundos (simula reinicio de software).
-   - `hard_shutdown`: apaga el contenedor Docker del nodo si el SDK de Docker está disponible; si no, simula la acción.
-   - `set_hvac_mode`: configura el modo HVAC.
-3. Publica el efecto correspondiente en `dc/actuator/zona/{Z}/rack/{R}` para que `collector.py` lo procese.
-4. Publica el ACK en `dc/ack/zona/{Z}/rack/{R}` con estado `ACKED` o `FAILED`.
+Cuando un nodo recibe `hard_shutdown`, el proceso:
+1. Llama a `_docker_stop(MY_CONTAINER_NAME)` — detiene el contenedor real.
+2. Marca `_nodo_apagado = True` (bandera protegida por `threading.Lock()`).
+
+A partir de ese momento:
+
+```python
+# publicar_nodo: silenciado cuando _nodo_apagado == True
+def publicar_nodo(client):
+    if _is_node_shutdown():
+        print(f"[SILENCIO] Nodo APAGADO — sin telemetría de {NODO_ID}")
+        return           # ← no publica NADA
+
+# publicar_ambiente: SIEMPRE publica, pero con carga CPU = 0
+def publicar_ambiente(client):
+    carga_cpu = 0.0 if _is_node_shutdown() else nodo.get_payload()["cpu_usage_pct"]
+    rack.update_environment(carga_cpu)   # ← temperatura baja gradualmente
+    ...
+```
+
+El `EnvironmentSimulator` recibe `cpu_efectiva = 0.0`, lo que desplaza su temperatura objetivo hacia abajo, **simulando el enfriamiento progresivo del rack** tras el apagado del servidor. La telemetría ambiental continúa publicándose ininterrumpidamente, lo que permite al Frontend mostrar la curva de descenso de temperatura mientras el nodo está OFFLINE.
+
+**Comportamiento del Frontend ante esta inercia (ver §6.3):** cuando el nodo está OFFLINE, el Frontend recibe los eventos `telemetry_environment_received` y actualiza `temp` y `humidity` en las métricas del nodo (para mostrar la temperatura actual del rack y evaluar el desbloqueo del botón de recuperación), pero **no agrega esos puntos al historial** de la gráfica (evita trazar una línea "fantasma" congelada).
 
 ---
 
-### 3.4 Variables de entorno (`config.env.example`)
+### 3.4 Guardia Anti Fan-out — Cláusula de Identidad de Nodo
+
+Todos los agentes de un rack suscriben al **mismo tópico** `dc/control/zona/{Z}/rack/{R}`. Sin filtrado, un comando `hard_shutdown` dirigido a N1 sería ejecutado por N2, N3, etc. del mismo rack.
+
+La solución es una **cláusula de guarda** en `_ejecutar_comando`:
+
+```python
+NODE_LEVEL_ACTIONS = {"soft_reboot", "hard_shutdown", "start_node"}
+
+if action in NODE_LEVEL_ACTIONS and target_type == "nodo" and target_id != NODO_ID:
+    print(f"[IGNORADO] '{action}' para '{target_id}' — este nodo es '{NODO_ID}'")
+    return
+```
+
+Solo `set_hvac_mode` omite la guardia, ya que opera sobre el rack completo y debe ejecutarse en todos los agentes del rack.
+
+**Nombre de contenedor Docker:** `MY_CONTAINER_NAME` se construye a partir de las variables de entorno para coincidir exactamente con el nombre real del contenedor en Docker:
+
+```python
+MY_CONTAINER_NAME = f"sedcm-edge-agent-{RACK_ID.lower()}-{NODO_ID.lower()}"
+# Ejemplo: RACK_ID=A1, NODO_ID=N1 → "sedcm-edge-agent-a1-n1"
+```
+
+Este nombre se usa en `_docker_stop()` y `_docker_start()` para controlar los contenedores reales vía la API de Docker SDK.
+
+---
+
+### 3.5 Variables de entorno (`config.env.example`)
 
 | Variable | Valor por defecto | Descripción |
 |---|---|---|
@@ -130,7 +186,7 @@ Escucha los comandos que el backend publica y los ejecuta. Luego informa el resu
 | `NODE_INTERVAL_S` | `5` | Segundos entre publicaciones de nodo |
 | `ENV_INTERVAL_S` | `10` | Segundos entre publicaciones de ambiente |
 | `SIM_SEED` | _(vacío)_ | Semilla RNG para reproducibilidad |
-| `EXECUTOR_ID` | `executor-{Z}-{R}` | Identificador del ejecutor |
+| `EXECUTOR_ID` | `executor-{Z}-{R}` | Identificador del ejecutor (en ACKs) |
 | `ACK_DELAY_S` | `0.5` | Segundos de espera antes de enviar ACK |
 
 ---
@@ -139,19 +195,22 @@ Escucha los comandos que el backend publica y los ejecuta. Luego informa el resu
 
 Eclipse Mosquitto 2 actúa como intermediario de mensajes. No tiene lógica de negocio: su único rol es recibir mensajes publicados en un tópico y distribuirlos a todos los suscriptores de ese tópico.
 
+Mosquitto está configurado para escuchar en `0.0.0.0:1883`, lo que lo hace accesible desde cualquier PC en la misma red LAN. Esto permite que las zonas invitadas (compañeros de clase con el repositorio standalone) publiquen su telemetría al mismo broker del servidor central.
+
 ### Tópicos del sistema
 
 | Tópico | Publicador | Suscriptor | Propósito |
 |---|---|---|---|
-| `dc/telemetria/zona/{Z}/rack/{R}/nodo/{N}` | Edge Collector | Backend | Métricas de nodo (CPU, RAM, red) |
-| `dc/telemetria/zona/{Z}/rack/{R}/ambiente` | Edge Collector | Backend | Métricas ambientales (temp, humedad) |
-| `dc/control/zona/{Z}/rack/{R}` | Backend | Edge Executor | Comandos de mitigación |
-| `dc/ack/zona/{Z}/rack/{R}` | Edge Executor | Backend | Confirmación de ejecución (ACK) |
-| `dc/actuator/zona/{Z}/rack/{R}` | Edge Executor | Edge Collector | Efectos de actuadores (reinicio, HVAC) |
+| `dc/telemetria/zona/{Z}/rack/{R}/nodo/{N}` | Edge Agent | Backend | Métricas de nodo (CPU, RAM, red) |
+| `dc/telemetria/zona/{Z}/rack/{R}/ambiente` | Edge Agent | Backend | Métricas ambientales (temp, humedad) |
+| `dc/control/zona/{Z}/rack/{R}` | Backend | Edge Agent | Comandos de mitigación |
+| `dc/ack/zona/{Z}/rack/{R}` | Edge Agent | Backend | Confirmación de ejecución (ACK) |
 
 > **{Z}** = código de zona (ej: `A`, `B`)  
 > **{R}** = código de rack (ej: `A1`, `B2`)  
-> **{N}** = ID de nodo (ej: `nodo_web_01`)
+> **{N}** = ID de nodo (ej: `N1`, `BN1`)
+
+> **Nota:** El tópico `dc/actuator/` de la arquitectura anterior ha sido eliminado. El agente unificado `agent.py` actúa directamente sobre los objetos de emulación sin necesitar ese canal intermediario.
 
 ---
 
@@ -179,8 +238,8 @@ Archivo que inicia el sistema. Coordina en orden:
 Centraliza todas las variables de entorno con valores por defecto seguros. Define el tipo `AppEnv` con:
 - `PORT`: puerto HTTP (default: 3000)
 - `MQTT_BROKER_URL`: URL del broker (default: `mqtt://localhost:1883`)
-- `OFFLINE_TIMEOUT_MS`: tiempo sin telemetría para declarar nodo offline (default: 30000 ms)
-- `ESCALATION_GRACE_MS`: tiempo de espera entre soft_reboot y hard_shutdown (default: 30000 ms)
+- `OFFLINE_TIMEOUT_MS`: tiempo sin telemetría para declarar nodo offline (default: 30 000 ms)
+- `ESCALATION_GRACE_MS`: tiempo de espera entre soft_reboot y hard_shutdown (default: 30 000 ms)
 - Variables de conexión PostgreSQL (DATABASE_URL o PGHOST/PGPORT/etc.)
 
 ---
@@ -210,7 +269,7 @@ Es el módulo más importante del backend. Orquesta el flujo completo desde que 
 
 Valida y extrae metadatos de los tópicos MQTT.
 
-- **Formato nodo:** `dc/telemetria/zona/A/rack/A1/nodo/nodo_web_01` → 8 segmentos
+- **Formato nodo:** `dc/telemetria/zona/A/rack/A1/nodo/N1` → 8 segmentos
 - **Formato ambiente:** `dc/telemetria/zona/A/rack/A1/ambiente` → 7 segmentos
 - Rechaza tópicos mal formados con un resultado de error detallado.
 
@@ -227,7 +286,7 @@ Dos validadores según el tipo de telemetría:
 
 **`environment-telemetry.validator.ts`**
 - Misma lógica de timestamp.
-- Valida `temperature_c` (−10 a 85 °C) y `humidity_pct` (0–100%).
+- Valida `temperature_c` (−10 a 85 °C) y `humidity_pct` (0–100 %).
 
 ---
 
@@ -326,9 +385,9 @@ Procesa las confirmaciones que llegan por `dc/ack/zona/{Z}/rack/{R}`:
 
 ---
 
-### 5.12 API REST — `bootstrap/http.ts`
+### 5.12 API REST y Protección Anti-Spam — `bootstrap/http.ts`
 
-Servidor HTTP nativo (sin Express). Expone endpoints de lectura y un endpoint de comando manual.
+Servidor HTTP **nativo de Node.js** (sin Express ni frameworks externos). Expone endpoints de lectura y un endpoint de comando manual con validación de doble capa.
 
 | Método | Endpoint | Descripción |
 |---|---|---|
@@ -340,6 +399,47 @@ Servidor HTTP nativo (sin Express). Expone endpoints de lectura y un endpoint de
 | GET | `/api/v1/telemetry/environment` | Historial ambiental de rack (`?zone_code&rack_code&limit`) |
 | GET | `/api/v1/audit/commands` | Bitácora de comandos (`?zone_code&rack_code&node_id&action&limit`) |
 | POST | `/api/v1/commands` | Despacho manual de comando |
+
+#### Flujo de validación en `POST /api/v1/commands`
+
+```
+Petición POST llega con JSON body
+         ↓
+1. readJsonBody()        — parseo del body crudo
+         ↓
+2. validateManualCommandBody()  — validación semántica:
+   • zone_code, rack_code, target_type, target_id, action, reason: requeridos
+   • target_type ∈ {"nodo", "rack"}
+   • action ∈ {"soft_reboot", "hard_shutdown", "set_hvac_mode", "start_node"}
+   • soft_reboot y start_node requieren target_type="nodo"
+   • set_hvac_mode requiere target_type="rack" y campo mode presente
+         ↓ (si falla → HTTP 400)
+3. ¿MQTT client disponible?
+         ↓ (si no → HTTP 503)
+4. ¿action === "start_node"?
+   → hasRecentNodeCommandByStatuses({ statuses: ["PENDING"], windowSeconds: 30 })
+   → Consulta PostgreSQL: ¿existe start_node PENDING para este node_id en últimos 30 s?
+         ↓ (si existe → HTTP 409 Conflict "command_already_pending")
+5. dispatchManualCommand()  — publica en MQTT + registra en audit_command_log
+         ↓
+   → HTTP 202 Accepted { command_id, action, mqtt_topic, ack_status: "PENDING" }
+```
+
+La protección del paso 4 usa la función `hasRecentNodeCommandByStatuses` del repositorio de auditoría, que ejecuta la siguiente consulta SQL:
+
+```sql
+SELECT EXISTS (
+  SELECT 1
+  FROM audit_command_log
+  WHERE node_id = $1
+    AND target_type = 'nodo'
+    AND action = $2
+    AND ack_status = ANY($3::text[])
+    AND issued_at >= now() - make_interval(secs => $4)
+) AS exists
+```
+
+La lista de `statuses` es parametrizable (`ANY($3::text[])`), lo que permite al motor de reglas reutilizar esta función con diferentes combinaciones de estado (por ejemplo, la lógica de escalación verifica `["PENDING", "ACKED"]`).
 
 ---
 
@@ -355,7 +455,7 @@ Mantiene conexiones WebSocket con el frontend en `ws://localhost:3000/ws`. Cuand
 | `telemetry_environment_received` | Telemetría ambiental ingresada | `zone_code, rack_code, environment` |
 | `node_status_changed` | Estado de nodo cambia | `zone_code, rack_code, node_id, new_status` |
 | `rack_status_changed` | Estado de rack cambia | `zone_code, rack_code, new_status` |
-| `command_published` | Comando enviado al broker | `zone_code, rack_code, action, node_id, reason` |
+| `command_published` | Comando enviado al broker | `zone_code, rack_code, action, node_id, reason, mode` |
 | `command_ack_received` | ACK recibido del edge | `command_id, status, zone_code, rack_code` |
 | `escalation_event` | Cambio en proceso de escalación | `stage, zone_code, rack_code, node_id` |
 
@@ -369,7 +469,7 @@ Capa de acceso a datos. Toda interacción con PostgreSQL pasa por aquí.
 |---|---|
 | `db.ts` | Pool de conexiones PostgreSQL; `withDbClient()` para transacciones |
 | `telemetry.repository.ts` | Inserta telemetría en tablas de hechos; hace UPSERT en inventario |
-| `command-audit.repository.ts` | Registra comandos; detecta duplicados en ventana de 300 s; actualiza ACKs |
+| `command-audit.repository.ts` | Registra comandos; detecta duplicados en ventana de 30–300 s; actualiza ACKs |
 | `query.repository.ts` | Consultas de lectura para la API REST (inventario, historial, bitácora) |
 
 ---
@@ -394,7 +494,7 @@ App.jsx  (estado global + WebSocket + REST)
 
 ---
 
-### 6.2 `App.jsx` — Componente raíz
+### 6.2 `App.jsx` — Componente raíz y estado global
 
 Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexiones con el backend.
 
@@ -403,16 +503,17 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
 - `selectedZone` / `selectedRack`: navegación actual del usuario
 - `hvacModeByRack`: mapa `{rack_id: "cooling"|"humidify"|"dehumidify"|"off"}` actualizado por WebSocket
 - `logs`: últimos 200 eventos para el panel de logs
-- `wsStatus`: estado de la conexión WebSocket
+- `wsStatus`: estado de la conexión WebSocket (`"conectando"` | `"conectado"` | `"reconectando"` | `"error"`)
+- `recoveringNodes`: Set de IDs de nodos con un comando `start_node` en vuelo (ver §6.3)
 
 **Al iniciar la aplicación:**
 1. Hace GET `/api/v1/inventory` y construye el árbol de zonas en `buildZonesFromInventory()`.
-2. Carga los últimos 50 comandos de `/api/v1/audit/commands` para poblar el log inicial.
-3. Abre conexión WebSocket y empieza a recibir eventos en tiempo real.
+2. Abre conexión WebSocket y empieza a recibir eventos en tiempo real.
+3. Al conectar el WebSocket, carga los últimos 50 comandos de `/api/v1/audit/commands` para poblar el log inicial.
 
 **Al seleccionar un rack:**
-- Hace GET `/api/v1/telemetry/node` y GET `/api/v1/telemetry/environment` para cargar hasta 60 puntos históricos.
-- Fusiona esos datos con las métricas actuales de cada servidor.
+- Hace GET `/api/v1/telemetry/node` y GET `/api/v1/telemetry/environment` en paralelo (hasta 60 puntos históricos).
+- Combina el historial de nodo con el ambiental más cercano por timestamp y fusiona con los puntos ya en vivo del WebSocket, sin duplicar.
 
 **Conversiones de métricas (backend → frontend):**
 
@@ -424,22 +525,82 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
 | `humidity_pct` | % | `humidity` | Sin conversión |
 | `net_rx + net_tx bytes/s` | bytes/s | `net` | `bytes/s ÷ 125 000` (→ Mbps) |
 
+**Comportamiento especial de nodos OFFLINE:**
+
+Cuando llega `node_status_changed` con `new_status === "OFFLINE"`:
+1. Los campos `cpu`, `ram`, `net` se zerean en las métricas actuales.
+2. Se agrega un punto final al historial con esos valores en cero, para que la gráfica muestre la caída antes de detenerse.
+
+Cuando llega `telemetry_environment_received` y el nodo está OFFLINE:
+- Se actualizan `temp` y `humidity` en las métricas actuales (para el criterio del botón de recuperación y el indicador de HVAC).
+- **No** se agrega el punto al historial (evita trazar una línea "fantasma" mientras el nodo está apagado).
+
 ---
 
-### 6.3 Componentes de presentación
+### 6.3 Estado Transaccional — `recoveringNodes` y el Botón de Recuperación
+
+El botón **"Recuperar Nodo"** implementa un **patrón de actualización optimista** para evitar doble clic y dar retroalimentación visual inmediata al operador.
+
+**Flujo completo:**
+
+```
+Operador hace clic en "Recuperar Nodo"
+         ↓
+sendCommand({ action: "start_node", target_id: server.id, … })
+         ↓ fetch POST /api/v1/commands
+         ↓
+¿Respuesta OK (202)?
+   SÍ → setRecoveringNodes(prev => new Set([...prev, target_id]))
+         Botón cambia a "Recuperando…" (disabled)
+   NO → pushLog({ level: "warn", text: "Error al despachar…" })
+         Botón permanece habilitado
+
+         ↑ (mientras tanto, en el backend: agent.py ejecuta start_node,
+            reanuda publicación de telemetría, el nodo sale de OFFLINE)
+
+Llega evento WebSocket: node_status_changed { new_status: "Normal" }
+         ↓
+if (data.new_status !== "OFFLINE"):
+   setRecoveringNodes(prev → prev.delete(data.node_id))
+         Botón desaparece (el nodo ya no está OFFLINE)
+```
+
+**Condiciones para que el botón "Recuperar Nodo" esté habilitado:**
+
+```javascript
+// En RackDetail.jsx
+const canRecover = isOffline && rackAmbientTemp <= 42 && !isRecovering
+```
+
+| Condición | Descripción |
+|---|---|
+| `isOffline` | `health_status === "OFFLINE"` |
+| `rackAmbientTemp <= 42` | Temperatura promedio del rack ≤ 42 °C (evita reiniciar un servidor en un rack caliente) |
+| `!isRecovering` | No hay un `start_node` en vuelo para este nodo |
+
+La **temperatura del rack** se calcula como el promedio de `metrics.temp` de todos los nodos del rack (todos comparten la misma fuente ambiental publicada por `publicar_ambiente()` del agente). Esto es correcto porque la telemetría ambiental continúa llegando incluso con el nodo OFFLINE, gracias a la inercia térmica del agente.
+
+**Texto del tooltip del botón:**
+- `isRecovering`: `"Comando de recuperación en progreso — esperando confirmación del nodo"`
+- `canRecover` (no recovering): `"Enviar comando start_node al nodo"`
+- `!canRecover && !isRecovering`: `"Rack a XX.X°C — espera enfriamiento (≤ 42°C)"`
+
+---
+
+### 6.4 Componentes de presentación
 
 | Componente | Props principales | Propósito |
 |---|---|---|
 | `ZoneSelector` | `zones, onSelect, selected` | Botones de selección de zona en el sidebar |
 | `RackList` | `zone, onSelect` | Grid de cards de racks con estado de color (Normal/Warning/Crítico) |
-| `RackDetail` | `rack, onBack` | Vista detallada: grid de servidores + historial expandible |
+| `RackDetail` | `rack, onBack, onCommand, recoveringNodes` | Vista detallada: grid de servidores + historial expandible + botón de recuperación |
 | `ZoneControls` | `zone, controls, onChange, selectedRack, hvacMode` | Contenedor del panel derecho |
-| `HVACControl` | `rack, hvacMode` | Indicador de modo HVAC actual (solo lectura, controlado automáticamente) |
+| `HVACControl` | `rack, hvacMode` | Indicador de modo HVAC actual (solo lectura, controlado automáticamente por el Motor de Reglas) |
 | `ExtractorControl` | `value, simulate` | Indicador visual de uso de extractores |
 | `LogsPanel` | `logs` | Lista de eventos con auto-scroll y colores por nivel |
 | `LineChart` | `data, metric, width, height` | Gráfica SVG con curva Bézier, área rellena y tooltip |
 
-> **Nota sobre HVACControl:** El sistema activa el HVAC automáticamente según las reglas de temperatura y humedad. El usuario solo puede ver el estado actual — no hay botones de control manual.
+> **Nota sobre HVACControl:** El HVAC se activa **automáticamente** según las reglas del Motor de Reglas del backend. El componente es un indicador de solo lectura. No hay botones de control manual de HVAC.
 
 ---
 
@@ -448,7 +609,7 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
 ### Escenario A — Telemetría normal
 
 ```
-1. collector.py publica cada 5 s en dc/telemetria/zona/A/rack/A1/nodo/nodo_web_01
+1. agent.py publica cada 5 s en dc/telemetria/zona/A/rack/A1/nodo/N1
 2. Backend recibe → valida → normaliza → deduplica → persiste en PostgreSQL
 3. broadcastRealtimeEvent("telemetry_node_received", {...métricas})
 4. App.jsx recibe por WebSocket → actualiza metrics del servidor en el estado
@@ -470,8 +631,9 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
    → Registra en audit_command_log (PENDING)
    → WebSocket emite command_published
 
-4. executor.py recibe el comando, simula reinicio (2 s)
-   → Publica en dc/actuator: efecto cpu_cooldown (TTL 30 s)
+4. agent.py recibe el comando en _ejecutar_comando
+   → Guardia: target_id coincide con NODO_ID → se ejecuta
+   → nodo.soft_reboot() resetea CPU/RAM a estado base directamente en objeto
    → Publica ACK en dc/ack/zona/A/rack/A1 con status=ACKED
 
 5. ack-handler recibe ACK
@@ -482,24 +644,75 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
    y han pasado ≥ 30 s desde el soft_reboot:
    → command-dispatcher publica hard_shutdown
    → escalation_event emitido por WebSocket (stage: hard_shutdown_selected)
+
+7. agent.py recibe hard_shutdown
+   → Guardia: target_id == NODO_ID → se ejecuta
+   → _docker_stop("sedcm-edge-agent-a1-n1")
+   → _set_node_shutdown(True) — telemetría de nodo silenciada
+   → La telemetría ambiental sigue con carga_cpu=0.0 (inercia térmica)
 ```
 
 ### Escenario C — Temperatura alta y activación de HVAC
 
 ```
-1. collector.py publica temperatura = 32 °C en dc/telemetria/.../ambiente
+1. agent.py publica temperatura = 32 °C en dc/telemetria/.../ambiente
 2. Backend evalúa: 28 ≤ 32 < 45 → status = "Warning" ambiental
 3. command-dispatcher: Temp en Warning → set_hvac_mode cooling
    → Publica en dc/control/zona/A/rack/A1
    → WebSocket emite command_published {action: "set_hvac_mode", mode: "cooling"}
 
-4. App.jsx recibe el evento → hvacModeByRack["A1"] = "cooling"
+4. App.jsx recibe el evento → hvacModeByRack["A-A1"] = "cooling"
 5. HVACControl.jsx muestra: "Enfriamiento activo" (color azul)
 
-6. executor.py recibe el comando
-   → Publica en dc/actuator: efecto environment_cooling (TTL 45 s)
-   → collector.py recibe efecto → EnvironmentSimulator cambia modo a "cooling"
+6. agent.py recibe el comando en _ejecutar_comando
+   → set_hvac_mode NO pasa por la guardia de node_id (es una acción de rack)
+   → rack.set_hvac_mode("cooling") actúa directamente sobre el objeto
    → La temperatura empieza a bajar gradualmente en próximas telemetrías
+   → Publica ACK en dc/ack con status=ACKED
+```
+
+### Escenario D — Recuperación manual de nodo OFFLINE
+
+```
+1. Nodo en estado OFFLINE (sin telemetría > 30 s)
+   Temperatura del rack = 35 °C (≤ 42 °C)
+   → Botón "Recuperar Nodo" habilitado en el Dashboard
+
+2. Operador hace clic
+   → Frontend envía POST /api/v1/commands { action: "start_node", target_id: "N1", … }
+   → Frontend agrega "N1" a recoveringNodes → botón cambia a "Recuperando…"
+
+3. http.ts recibe la petición
+   → validateManualCommandBody: OK
+   → hasRecentNodeCommandByStatuses(node_id="N1", action="start_node",
+       statuses=["PENDING"], windowSeconds=30) → false (no hay duplicado)
+   → dispatchManualCommand: publica en dc/control/zona/A/rack/A1
+   → Registra start_node PENDING en audit_command_log
+   → Responde HTTP 202 { command_id, action, mqtt_topic, ack_status: "PENDING" }
+
+4. Si el operador vuelve a hacer clic antes de 30 s:
+   → http.ts consulta PostgreSQL → start_node PENDING encontrado
+   → Responde HTTP 409 { error: "command_already_pending", detail: "…" }
+   → Frontend registra aviso en el LogsPanel (no duplica el comando)
+
+5. agent.py recibe start_node en dc/control/zona/A/rack/A1
+   → Guardia: target_id=="N1" == NODO_ID → se ejecuta
+   → _docker_start("sedcm-edge-agent-a1-n1")
+   → nodo.soft_reboot() → CPU/RAM reseteados a ~15 %
+   → _set_node_shutdown(False) → publicar_nodo() reanuda
+   → Publica ACK status=ACKED en dc/ack
+
+6. Backend recibe ACK → actualiza audit_command_log (ACKED)
+   → WebSocket emite command_ack_received
+
+7. El nodo comienza a publicar telemetría
+   → offline-monitor detecta last_seen_at actualizado → health_status = "Normal"
+   → WebSocket emite node_status_changed { new_status: "Normal" }
+
+8. Frontend recibe node_status_changed:
+   → setRecoveringNodes → elimina "N1" del Set
+   → health_status del nodo actualizado en el árbol de zonas
+   → Botón "Recuperar Nodo" desaparece (el nodo ya no es OFFLINE)
 ```
 
 ---
@@ -516,7 +729,7 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
 | `inventory_rack` | Racks por zona. Incluye `environment_status` (Normal/Warning/Crítico/OFFLINE) y `last_seen_at`. |
 | `inventory_node` | Nodos por rack. Incluye `health_status` y `last_seen_at`. Se mueve a otro rack si cambia de ubicación. |
 | `inventory_node_location_history` | Historial de reubicaciones de un nodo entre racks. |
-| `telemetry_node` | Serie de tiempo de métricas de nodo (CPU%, RAM MB, red bytes/s). Un registro por evento MQTT. |
+| `telemetry_node` | Serie de tiempo de métricas de nodo (CPU %, RAM MB, red bytes/s). Un registro por evento MQTT. |
 | `telemetry_environment` | Serie de tiempo de ambiente por rack (temp °C, humedad %). |
 | `audit_command_log` | Registro de todos los comandos emitidos (manuales y automáticos), su payload MQTT y el resultado del ACK. |
 
@@ -531,28 +744,9 @@ Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexi
 
 ---
 
-## 9. Referencia rápida — ¿Dónde está cada cosa?
+## 9. Topología Distribuida LAN y Retos de Concurrencia Superados
 
-| Necesito cambiar... | Archivo |
-|---|---|
-| Umbrales de CPU/RAM | `src/rules/rules-engine.ts` |
-| Umbrales de temperatura/humedad | `src/rules/rules-engine.ts` |
-| Tiempo de gracia antes de hard_shutdown | `src/config/env.ts` → `ESCALATION_GRACE_MS` |
-| Tiempo para declarar nodo OFFLINE | `src/config/env.ts` → `OFFLINE_TIMEOUT_MS` |
-| Lógica de escalación de comandos | `src/commands/command-dispatcher.ts` |
-| Endpoints de la API REST | `src/bootstrap/http.ts` |
-| Eventos WebSocket | `src/realtime/ws-server.ts` |
-| Consultas a la base de datos | `src/repositories/query.repository.ts` |
-| Comportamiento del simulador de nodo | `Aplicacion/edge-agent/emuladores.py` |
-| Estado global del dashboard | `Aplicacion/Front-End/SEDCMFront/src/App.jsx` |
-| Estilos y colores del dashboard | `Aplicacion/Front-End/SEDCMFront/src/styles.css` |
-| Esquema de la base de datos | `Aplicacion/Back-End/backend_SEDCM/db/schema.md` |
-
----
-
-## 10. Topología distribuida LAN y bugs resueltos (2026-06-01)
-
-### 10.1 Topología final
+### 9.1 Topología final
 
 El sistema opera en red LAN con dos tipos de nodos:
 
@@ -574,43 +768,75 @@ Levanta 7 servicios con `docker compose up --build` desde `Aplicacion/Back-End/b
 
 Clonan el repositorio standalone `JPalexo/sedcm-edge-agent`, crean un `.env` con `MQTT_HOST=<IP_LAN>` y `EDGE_ZONE=B` (o C, D…) y ejecutan `docker compose up --build -d`. Esto levanta 4 contenedores que aparecen como una nueva zona en el dashboard.
 
-`Aplicacion/edge-agent/` en el monorepo es un Git Submodule que apunta a `JPalexo/sedcm-edge-agent`.
+`Aplicacion/edge-agent/` en el monorepo es un **Git Submodule** que apunta a `JPalexo/sedcm-edge-agent`. Esto permite al repositorio del monorepo referenciar una versión específica del agente sin copiar su código, y a los compañeros clonar el repositorio del agente de forma independiente para sus PCs invitadas.
 
-### 10.2 Bug resuelto — Fan-out de comandos MQTT
+---
 
-**Síntoma:** Con 2 nodos por rack, un `hard_shutdown` para N1 también silenciaba a N2. Ambos racks de la Zona A aparecían como "fantasmas" (0.0°C, sin nodos).
+### 9.2 Reto 1 — Fan-out sin filtrado en MQTT
 
-**Causa raíz:** Todos los agentes de un rack suscriben al mismo tópico de control `dc/control/zona/{Z}/rack/{R}`. El `_ejecutar_comando` de `agent.py` no verificaba si el comando era para su propio `NODO_ID`, ejecutando `_set_node_shutdown(True)` en todos los nodos del rack indiscriminadamente. Además, `_docker_stop(target_id)` usaba el `node_id` (ej. `"N1"`) como nombre de contenedor Docker, pero el nombre real es `sedcm-edge-agent-a1-n1`, lo que hacía que el stop siempre fallara silenciosamente.
+**Síntoma:** Con 2 nodos por rack, un `hard_shutdown` para N1 también silenciaba a N2. Ambos nodos del rack aparecían OFFLINE y el rack completo mostraba `0.0°C` ("nodo fantasma").
 
-**Fix en `agent.py`:**
+**Causa raíz:** Todos los agentes de un rack suscriben al mismo tópico de control `dc/control/zona/{Z}/rack/{R}`. El `_ejecutar_comando` original no verificaba si el comando era para su propio `NODO_ID`, ejecutando `_set_node_shutdown(True)` en todos los nodos del rack. Además, `_docker_stop` usaba el `node_id` crudo (ej. `"N1"`) como nombre de contenedor Docker, pero el nombre real es `"sedcm-edge-agent-a1-n1"`, causando fallos silenciosos.
+
+**Fix implementado en `agent.py`:**
+
 ```python
-# Nombre real del contenedor (ej. sedcm-edge-a1-n1)
-MY_CONTAINER_NAME = f"sedcm-edge-{RACK_ID.lower()}-{NODO_ID.lower()}"
+# 1. Nombre real del contenedor construido desde variables de entorno
+MY_CONTAINER_NAME = f"sedcm-edge-agent-{RACK_ID.lower()}-{NODO_ID.lower()}"
 
-# Guardia en _ejecutar_comando: ignorar comandos de nodo dirigidos a otro nodo
+# 2. Guardia en _ejecutar_comando: ignorar comandos de nodo dirigidos a otro nodo
 NODE_LEVEL_ACTIONS = {"soft_reboot", "hard_shutdown", "start_node"}
 if action in NODE_LEVEL_ACTIONS and target_type == "nodo" and target_id != NODO_ID:
     print(f"[IGNORADO] '{action}' para '{target_id}' — este nodo es '{NODO_ID}'")
     return
 ```
 
-### 10.3 Bug resuelto — Colisión de clave primaria en PostgreSQL
+**Resultado:** Cada agente solo ejecuta los comandos que le corresponden. `set_hvac_mode` no requiere guardia porque opera sobre el rack completo y debe ejecutarse en todos los agentes del rack.
 
-**Síntoma:** Al conectar una Zona B con NODE_IDs N1-N4, los racks de Zona B aparecían vacíos y los de Zona A perdían sus nodos intermitentemente.
+---
 
-**Causa raíz:** El repositorio de telemetría usa `ON CONFLICT (node_id)` con `node_id` como única clave (sin incluir zona ni rack). Cuando Zona B publicaba telemetría con `node_id=N1`, el `ON CONFLICT` actualizaba la fila existente de Zona A, reasignando N1 de la Zona A a la Zona B. Las dos zonas se "robaban" los nodos ciclo a ciclo.
+### 9.3 Reto 2 — Colisión de Clave Primaria en PostgreSQL
 
-**Fix en `edge-agent/docker-compose.yml`:** Los NODE_IDs del compose standalone llevan prefijo de zona:
+**Síntoma:** Al conectar una Zona B con NODE_IDs `N1-N4`, los racks de Zona B aparecían vacíos y los de Zona A perdían sus nodos intermitentemente.
+
+**Causa raíz:** El repositorio de telemetría usaba `ON CONFLICT (node_id)` con `node_id` como única clave (sin incluir zona ni rack). Cuando Zona B publicaba telemetría con `node_id=N1`, el `ON CONFLICT` actualizaba la fila existente de Zona A, reasignando N1 de la Zona A a la Zona B. Las dos zonas se "robaban" los nodos ciclo a ciclo en una carrera de escrituras.
+
+**Fix en `edge-agent/docker-compose.yml`:** Los NODE_IDs del compose standalone llevan **prefijo de zona**:
 
 ```yaml
 NODE_ID: ${EDGE_ZONE:-B}N1   # → BN1 con EDGE_ZONE=B, CN1 con EDGE_ZONE=C
 ```
 
-La Zona A (servidor central) conserva N1-N4. Cada zona invitada usa IDs únicos globalmente (BN1-BN4, CN1-CN4, etc.).
+La Zona A (servidor central) conserva N1–N4. Cada zona invitada usa IDs únicos globalmente (BN1–BN4, CN1–CN4, etc.), eliminando la colisión en la clave única de PostgreSQL.
 
-### 10.4 Convención de nombres
+---
+
+### 9.4 Convención de nombres
 
 | Ubicación | Patrón `container_name` | Patrón `NODE_ID` | Ejemplo |
 |---|---|---|---|
-| Servidor (Zona A) | `sedcm-edge-agent-{rack}-{nodo}` | `N{n}` | `sedcm-edge-agent-a1-n1` / `N1` |
-| Standalone invitado | `sedcm-edge-{ZONE}{rack_num}-n{n}` | `{ZONE}N{n}` | `sedcm-edge-B1-n1` / `BN1` |
+| Servidor Central (Zona A) | `sedcm-edge-agent-{rack}-{nodo}` | `N{n}` | `sedcm-edge-agent-a1-n1` / `N1` |
+| PC Invitada | `sedcm-edge-{ZONE}{rack_num}-n{n}` | `{ZONE}N{n}` | `sedcm-edge-B1-n1` / `BN1` |
+
+---
+
+## 10. Referencia rápida — ¿Dónde está cada cosa?
+
+| Necesito cambiar... | Archivo |
+|---|---|
+| Umbrales de CPU/RAM | `src/rules/rules-engine.ts` |
+| Umbrales de temperatura/humedad | `src/rules/rules-engine.ts` |
+| Tiempo de gracia antes de hard_shutdown | `src/config/env.ts` → `ESCALATION_GRACE_MS` |
+| Tiempo para declarar nodo OFFLINE | `src/config/env.ts` → `OFFLINE_TIMEOUT_MS` |
+| Lógica de escalación de comandos | `src/commands/command-dispatcher.ts` |
+| Ventana de anti-spam del botón de recuperación | `src/bootstrap/http.ts` → `windowSeconds: 30` |
+| Umbral de temperatura para habilitar recuperación | `Aplicacion/Front-End/SEDCMFront/src/components/RackDetail.jsx` → `rackAmbientTemp <= 42` |
+| Endpoints de la API REST | `src/bootstrap/http.ts` |
+| Eventos WebSocket | `src/realtime/ws-server.ts` |
+| Consultas a la base de datos | `src/repositories/query.repository.ts` |
+| Comportamiento del simulador de nodo/rack | `Aplicacion/edge-agent/emuladores.py` |
+| Lógica del agente Edge (colector + ejecutor) | `Aplicacion/edge-agent/agent.py` |
+| Estado global del dashboard | `Aplicacion/Front-End/SEDCMFront/src/App.jsx` |
+| Estilos y colores del dashboard | `Aplicacion/Front-End/SEDCMFront/src/styles.css` |
+| Esquema de la base de datos | `Aplicacion/Back-End/backend_SEDCM/db/schema.md` |
+| Convención de nombres de contenedores (LAN) | `Aplicacion/edge-agent/docker-compose.yml` |
