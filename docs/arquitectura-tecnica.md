@@ -121,9 +121,11 @@ Importado por `agent.py`. Define las clases que modelan el comportamiento de los
 
 > **Regla de diseño:** El ciclo de vida del nodo de cómputo es independiente del ciclo de vida del rack ambiental.
 
-Cuando un nodo recibe `hard_shutdown`, el proceso:
-1. Llama a `_docker_stop(MY_CONTAINER_NAME)` — detiene el contenedor real.
+Cuando un nodo recibe `hard_shutdown`, el proceso ejecuta un **apagado puramente lógico** (ver §3.5 — Patrón BMC):
+1. Llama a `nodo.soft_reboot()` — resetea métricas a estado base (CPU 15 %, RAM 512 MB).
 2. Marca `_nodo_apagado = True` (bandera protegida por `threading.Lock()`).
+
+El contenedor **no se detiene**. El proceso `agent.py` continúa ejecutándose y escuchando el tópico MQTT de control.
 
 A partir de ese momento:
 
@@ -163,18 +165,73 @@ if action in NODE_LEVEL_ACTIONS and target_type == "nodo" and target_id != NODO_
 
 Solo `set_hvac_mode` omite la guardia, ya que opera sobre el rack completo y debe ejecutarse en todos los agentes del rack.
 
-**Nombre de contenedor Docker:** `MY_CONTAINER_NAME` se construye a partir de las variables de entorno para coincidir exactamente con el nombre real del contenedor en Docker:
+---
+
+### 3.5 Patrón BMC — Apagado Lógico sin Suicidio de Contenedor
+
+El **Patrón BMC** (Bare-Metal Container) es la solución adoptada para mantener vivo el listener MQTT durante un `hard_shutdown`, garantizando que el comando `start_node` siempre pueda ser recibido.
+
+#### El Problema Original
+
+La implementación inicial de `hard_shutdown` llamaba a `docker stop` sobre el contenedor propio del agente vía la API del Docker SDK:
 
 ```python
-MY_CONTAINER_NAME = f"sedcm-edge-agent-{RACK_ID.lower()}-{NODO_ID.lower()}"
-# Ejemplo: RACK_ID=A1, NODO_ID=N1 → "sedcm-edge-agent-a1-n1"
+# ❌ Implementación original — causaba suicidio del contenedor
+_docker_stop(MY_CONTAINER_NAME)  # ejecuta "docker stop" sobre sí mismo
 ```
 
-Este nombre se usa en `_docker_stop()` y `_docker_start()` para controlar los contenedores reales vía la API de Docker SDK.
+Esto producía la siguiente secuencia fatal:
+1. `agent.py` recibe `hard_shutdown` y llama `docker stop` sobre sí mismo.
+2. Docker envía `SIGTERM` al proceso PID 1 del contenedor (el propio `agent.py`).
+3. El proceso muere con **Exit Code 137** a mitad de `_ejecutar_comando`.
+4. La telemetría ambiental deja de publicarse → ruptura de la inercia térmica.
+5. Nadie queda suscrito a `dc/control` para recibir el `start_node` posterior.
+6. **Bug "Recuperando… infinito":** el Dashboard mostraba el nodo en estado "Recuperando…" de forma permanente porque el agente no podía escuchar el comando de arranque.
+
+#### La Solución — Apagado Puramente Lógico
+
+`hard_shutdown` y `start_node` son ahora **operaciones completamente lógicas** sobre el estado interno del agente:
+
+```python
+# ✅ Patrón BMC — el contenedor nunca se detiene
+
+def _set_node_shutdown(value: bool):
+    global _nodo_apagado
+    with _shutdown_lock:
+        _nodo_apagado = value
+
+# hard_shutdown: silencia telemetría del nodo y resetea métricas
+nodo.soft_reboot()            # CPU/RAM vuelven a estado base (15%)
+_set_node_shutdown(True)      # publicar_nodo() deja de emitir
+
+# start_node: reactiva el nodo
+nodo.soft_reboot()            # CPU/RAM reseteados a estado saludable
+_set_node_shutdown(False)     # publicar_nodo() reanuda la emisión
+```
+
+El proceso `agent.py` **permanece vivo** durante todo el ciclo de vida del contenedor. No se detiene, no se reinicia y no usa el Docker SDK.
+
+#### Garantías del Patrón
+
+| Propiedad | Garantía |
+|---|---|
+| Listener MQTT siempre activo | El cliente MQTT no muere nunca: puede recibir `start_node` en cualquier momento |
+| Inercia térmica ininterrumpida | `publicar_ambiente()` sigue corriendo con `cpu=0.0` → enfriamiento progresivo visible en el Dashboard |
+| Recuperación determinística | `start_node` siempre tiene un receptor → el ciclo OFFLINE → Normal es 100 % confiable |
+| Sin dependencia del Docker SDK | La dependencia `docker` fue eliminada de `requirements.txt`; el socket `/var/run/docker.sock` ya no es necesario |
+
+#### Limpieza de Código y Seguridad
+
+Como parte de este fix se eliminaron del repositorio:
+- Las funciones `_docker_stop()` y `_docker_start()`.
+- La variable `MY_CONTAINER_NAME` y el import del SDK de Docker.
+- Los scripts `collector.py` y `executor.py` (scripts standalone legacy que no se ejecutaban en Docker).
+
+El archivo `.env` (con la IP del broker MQTT y configuración de zona) fue asegurado en `.gitignore`, evitando que credenciales de red sean publicadas accidentalmente en el repositorio público. El archivo `.env.example` sirve como plantilla documentada sin valores sensibles.
 
 ---
 
-### 3.5 Variables de entorno (`config.env.example`)
+### 3.6 Variables de entorno (`config.env.example`)
 
 | Variable | Valor por defecto | Descripción |
 |---|---|---|
@@ -645,11 +702,12 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
    → command-dispatcher publica hard_shutdown
    → escalation_event emitido por WebSocket (stage: hard_shutdown_selected)
 
-7. agent.py recibe hard_shutdown
+7. agent.py recibe hard_shutdown (Patrón BMC — ver §3.5)
    → Guardia: target_id == NODO_ID → se ejecuta
-   → _docker_stop("sedcm-edge-agent-a1-n1")
+   → nodo.soft_reboot() — resetea CPU/RAM a estado base
    → _set_node_shutdown(True) — telemetría de nodo silenciada
-   → La telemetría ambiental sigue con carga_cpu=0.0 (inercia térmica)
+   → El contenedor sigue vivo; publicar_ambiente() continúa con carga_cpu=0.0 (inercia térmica)
+   → Publica ACK status=ACKED en dc/ack/zona/A/rack/A1
 ```
 
 ### Escenario C — Temperatura alta y activación de HVAC
@@ -695,12 +753,12 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
    → Responde HTTP 409 { error: "command_already_pending", detail: "…" }
    → Frontend registra aviso en el LogsPanel (no duplica el comando)
 
-5. agent.py recibe start_node en dc/control/zona/A/rack/A1
+5. agent.py recibe start_node en dc/control/zona/A/rack/A1 (Patrón BMC — ver §3.5)
    → Guardia: target_id=="N1" == NODO_ID → se ejecuta
-   → _docker_start("sedcm-edge-agent-a1-n1")
    → nodo.soft_reboot() → CPU/RAM reseteados a ~15 %
    → _set_node_shutdown(False) → publicar_nodo() reanuda
    → Publica ACK status=ACKED en dc/ack
+   (El contenedor nunca fue detenido; no se necesita docker start)
 
 6. Backend recibe ACK → actualiza audit_command_log (ACKED)
    → WebSocket emite command_ack_received
@@ -778,18 +836,17 @@ Clonan el repositorio standalone `JPalexo/sedcm-edge-agent`, crean un `.env` con
 
 **Causa raíz:** Todos los agentes de un rack suscriben al mismo tópico de control `dc/control/zona/{Z}/rack/{R}`. El `_ejecutar_comando` original no verificaba si el comando era para su propio `NODO_ID`, ejecutando `_set_node_shutdown(True)` en todos los nodos del rack. Además, `_docker_stop` usaba el `node_id` crudo (ej. `"N1"`) como nombre de contenedor Docker, pero el nombre real es `"sedcm-edge-agent-a1-n1"`, causando fallos silenciosos.
 
-**Fix implementado en `agent.py`:**
+**Fix implementado en `agent.py` (en dos commits — `ffd7ac3` + `dc9f5ef`):**
 
 ```python
-# 1. Nombre real del contenedor construido desde variables de entorno
-MY_CONTAINER_NAME = f"sedcm-edge-agent-{RACK_ID.lower()}-{NODO_ID.lower()}"
-
-# 2. Guardia en _ejecutar_comando: ignorar comandos de nodo dirigidos a otro nodo
+# Guardia en _ejecutar_comando: ignorar comandos de nodo dirigidos a otro nodo
 NODE_LEVEL_ACTIONS = {"soft_reboot", "hard_shutdown", "start_node"}
 if action in NODE_LEVEL_ACTIONS and target_type == "nodo" and target_id != NODO_ID:
     print(f"[IGNORADO] '{action}' para '{target_id}' — este nodo es '{NODO_ID}'")
     return
 ```
+
+> El fix original también incluía `MY_CONTAINER_NAME` y llamadas al Docker SDK. Esas partes fueron eliminadas en el fix **Patrón BMC** (ver §3.5): `hard_shutdown` y `start_node` son ahora lógicos y no necesitan conocer el nombre del contenedor.
 
 **Resultado:** Cada agente solo ejecuta los comandos que le corresponden. `set_hvac_mode` no requiere guardia porque opera sobre el rack completo y debe ejecutarse en todos los agentes del rack.
 
