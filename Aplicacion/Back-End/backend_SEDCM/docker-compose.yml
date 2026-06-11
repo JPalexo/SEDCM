@@ -3,16 +3,16 @@ services:
     image: postgres:16-alpine
     container_name: sedcm-postgres
     environment:
-      POSTGRES_DB: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -50,10 +50,11 @@ services:
       MQTT_RECONNECT_PERIOD_MS: 3000
       PGHOST: postgres
       PGPORT: 5432
-      PGDATABASE: postgres
-      PGUSER: postgres
-      PGPASSWORD: postgres
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
       PGSSLMODE: disable
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       NODE_ESCALATION_GRACE_MS: 30000
       OFFLINE_TIMEOUT_MS: 30000
       OFFLINE_SWEEP_INTERVAL_MS: 10000
