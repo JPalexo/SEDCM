@@ -664,7 +664,7 @@ Cuando llega `node_status_changed` con `new_status === "OFFLINE"`:
 2. Se agrega un punto final al historial con esos valores en cero, para que la gráfica muestre la caída antes de detenerse.
 
 Cuando llega `telemetry_environment_received` y el nodo está OFFLINE:
-- Se actualizan `temp` y `humidity` en las métricas actuales (para el criterio del botón de recuperación y el indicador de HVAC).
+- Se actualizan `temp` y `humidity` en las métricas actuales (para evaluar el criterio de temperatura del botón de recuperación).
 - **No** se agrega el punto al historial (evita trazar una línea "fantasma" mientras el nodo está apagado).
 
 ---
