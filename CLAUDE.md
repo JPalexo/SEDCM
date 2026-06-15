@@ -149,9 +149,8 @@ Tareas que cruzan capas → usar agentes en secuencia: `infra-agent` → `backen
 |---|---|
 | `docs/SEDCM_CONTEXT.md` | Diseño original del sistema (arquitectura, contratos, payloads) |
 | `docs/constitution.md` | Principios arquitectónicos no negociables del proyecto |
+| `docs/arquitectura-tecnica.md` | Arquitectura técnica actual del sistema (estado final) |
 | `docs/frontend-integration-contract.md` | Contrato REST + WebSocket entre frontend y backend |
 | `db/schema.md` | Documentación completa del esquema PostgreSQL |
-| `docs/backend/phases/` | 13 fases de desarrollo documentadas con decisiones de diseño |
 | `README_DEMO.md` | Guía de arranque con Docker y ejemplos curl |
 | `src/config/env.ts` | Todas las variables de entorno configurables |
-| `specs/` | Especificaciones de features con decisiones de diseño (Speckit) |
