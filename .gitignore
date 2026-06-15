@@ -10,9 +10,10 @@ __pycache__/
 .venv/
 venv/
 
-# Variables de entorno con secretos
+# Variables de entorno con secretos (las plantillas .example sí se versionan)
 .env
-.env.*
+.env.local
+.env.*.local
 config.env
 
 # Logs
