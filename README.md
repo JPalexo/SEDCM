@@ -35,7 +35,10 @@ Edge Agents (Python — 1 proceso por nodo)
 ```bash
 git clone https://github.com/JPalexo/SEDCM.git
 cd SEDCM
+git submodule update --init
 ```
+
+> El agente edge vive en un repositorio independiente enlazado como submodule. Sin este comando, la carpeta `Aplicacion/edge-agent/` queda vacía y el build de Docker falla con `Dockerfile: no such file or directory`.
 
 ### Paso 2 — Crear el archivo `.env` (obligatorio)
 
