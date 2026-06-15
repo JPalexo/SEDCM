@@ -24,6 +24,22 @@ El Motor de Reglas dispara mitigaciones automáticas. Adicionalmente, el Dashboa
 
 ---
 
+## Índice de Contenido
+
+1. [Introducción](#1-introducción)
+2. [Arquitectura General](#2-arquitectura-general)
+3. [Mapa Lógico de Directorios — Backend](#3-mapa-lógico-de-directorios--backend)
+4. [Capa Edge — Agente Python Unificado](#4-capa-edge--agente-python-unificado)
+5. [Capa Middleware — Broker MQTT](#5-capa-middleware--broker-mqtt)
+6. [Capa Backend — Control Plane](#6-capa-backend--control-plane)
+7. [Capa Frontend — Dashboard React](#7-capa-frontend--dashboard-react)
+8. [Flujo de extremo a extremo](#8-flujo-de-extremo-a-extremo)
+9. [Base de Datos PostgreSQL](#9-base-de-datos-postgresql)
+10. [Topología Distribuida LAN y Retos de Concurrencia Superados](#10-topología-distribuida-lan-y-retos-de-concurrencia-superados)
+11. [Referencia rápida — ¿Dónde está cada cosa?](#11-referencia-rápida--dónde-está-cada-cosa)
+
+---
+
 ## 2. Arquitectura General
 
 ```
@@ -65,11 +81,71 @@ El Motor de Reglas dispara mitigaciones automáticas. Adicionalmente, el Dashboa
 
 ---
 
-## 3. Capa Edge — Agente Python Unificado
+## 3. Mapa Lógico de Directorios — Backend
+
+**Directorio raíz:** `Aplicacion/Back-End/backend_SEDCM/src/`
+
+El backend está organizado en carpetas que reflejan su responsabilidad arquitectónica. Cada carpeta tiene un único propósito; ninguna carpeta cruza su frontera.
+
+```
+src/
+├── app.ts                  ← Punto de entrada: arranca todo el sistema en orden
+├── bootstrap/
+│   ├── http.ts             ← Servidor HTTP nativo (sin Express); define todos los endpoints REST
+│   └── mqtt.ts             ← Conexión al broker Mosquitto
+├── config/
+│   └── env.ts              ← Todas las variables de entorno con valores por defecto seguros
+├── ingest/                 ← Escudo de validación — filtra basura antes de que entre al sistema
+│   ├── validators/         ← Reglas de formato: rangos, timestamps, campos requeridos
+│   ├── normalizers/        ← Transforma al formato interno; detecta mensajes fuera de orden
+│   └── dedupe/             ← Anti-spam: descarta mensajes duplicados por SHA256 + timestamp
+├── mqtt/
+│   ├── subscriptions.ts    ← Orquestador principal: recibe MQTT, llama al pipeline completo
+│   ├── topic-parser.ts     ← Valida y extrae metadatos del tópico MQTT
+│   └── ack-handler.ts      ← Procesa confirmaciones (ACK) del agente edge
+├── rules/
+│   ├── rules-engine.ts     ← El cerebro: evalúa umbrales, decide estados (Normal/Warning/Crítico)
+│   └── offline-monitor.ts  ← Proceso paralelo: detecta nodos sin telemetría y los marca OFFLINE
+├── commands/
+│   └── command-dispatcher.ts ← Decide qué comando publicar y registra la auditoría
+├── repositories/           ← Única capa autorizada para hablar con PostgreSQL
+│   ├── db.ts               ← Pool de conexiones; función withDbClient() para transacciones
+│   ├── telemetry.repository.ts   ← Inserta telemetría; UPSERT en inventario de nodos/racks
+│   ├── command-audit.repository.ts ← Registra comandos; detecta duplicados; actualiza ACKs
+│   └── query.repository.ts ← Consultas de lectura para la API REST
+└── realtime/
+    └── ws-server.ts        ← Mantiene conexiones WebSocket; broadcast de eventos a todos los clientes
+```
+
+### Filosofía de cada carpeta
+
+**`/ingest` — El escudo de validación**
+
+Es la primera línea de defensa. Antes de que cualquier dato toque el motor de reglas o la base de datos, pasa obligatoriamente por tres etapas en secuencia: validación de formato y rangos, normalización al formato interno del sistema, y deduplicación por firma SHA256. Si un mensaje llega con un timestamp de hace una hora, campos nulos o duplicado, se descarta aquí. El resto del sistema puede asumir que los datos que le llegan son válidos.
+
+**`/rules` — El cerebro que toma decisiones**
+
+Contiene toda la lógica de negocio del sistema: qué es Normal, qué es Warning, qué es Crítico y qué acción corresponde a cada estado. El motor de reglas no persiste datos ni publica comandos directamente; solo evalúa y devuelve una decisión. El `offline-monitor` corre en paralelo como un proceso separado que examina periódicamente la tabla de inventario.
+
+**`/repositories` — La única puerta a PostgreSQL**
+
+Ninguna otra carpeta del sistema puede hacer consultas SQL directamente. Todo acceso a la base de datos pasa por esta capa. Esto centraliza las consultas, hace que los cambios de esquema solo requieran tocar un lugar y permite testear el resto del sistema con stubs de repositorio. Cada archivo de repositorio agrupa operaciones de un dominio específico.
+
+**`/mqtt` — El adaptador de protocolo**
+
+Traduce el protocolo MQTT (mensajes de bytes en tópicos) al mundo de objetos TypeScript. Contiene el suscriptor principal, el parseador de tópicos y el manejador de ACKs. No contiene lógica de negocio.
+
+**`/realtime` — El canal de broadcast al frontend**
+
+Mantiene el pool de conexiones WebSocket activas y expone una función `broadcastRealtimeEvent()` que usan todos los demás módulos para notificar al frontend. Actúa como un bus de eventos unidireccional (backend → frontend).
+
+---
+
+## 4. Capa Edge — Agente Python Unificado
 
 **Directorio:** `Aplicacion/edge-agent/` (Git Submodule → `JPalexo/sedcm-edge-agent`)
 
-### 3.1 Transición a microservicio unificado: `agent.py`
+### 4.1 Transición a microservicio unificado: `agent.py`
 
 La arquitectura inicial separaba la colección de telemetría (`collector.py`) de la ejecución de comandos (`executor.py`), comunicándolos a través de un tópico MQTT interno `dc/actuator/`. Esta separación fue reemplazada por un **proceso unificado `agent.py`** que consolida ambas responsabilidades.
 
@@ -96,7 +172,7 @@ Los comandos se procesan en **hilos separados** (`threading.Thread`) para no blo
 
 ---
 
-### 3.2 `emuladores.py` — Simuladores de física del rack
+### 4.2 `emuladores.py` — Simuladores de física del rack
 
 Importado por `agent.py`. Define las clases que modelan el comportamiento de los dispositivos con inercia y realismo.
 
@@ -117,11 +193,11 @@ Importado por `agent.py`. Define las clases que modelan el comportamiento de los
 
 ---
 
-### 3.3 Inercia Térmica — Principio del Ciclo de Vida Independiente
+### 4.3 Inercia Térmica — Principio del Ciclo de Vida Independiente
 
 > **Regla de diseño:** El ciclo de vida del nodo de cómputo es independiente del ciclo de vida del rack ambiental.
 
-Cuando un nodo recibe `hard_shutdown`, el proceso ejecuta un **apagado puramente lógico** (ver §3.5 — Patrón BMC):
+Cuando un nodo recibe `hard_shutdown`, el proceso ejecuta un **apagado puramente lógico** (ver §4.5 — Patrón BMC):
 1. Llama a `nodo.soft_reboot()` — resetea métricas a estado base (CPU 15 %, RAM 512 MB).
 2. Marca `_nodo_apagado = True` (bandera protegida por `threading.Lock()`).
 
@@ -145,11 +221,11 @@ def publicar_ambiente(client):
 
 El `EnvironmentSimulator` recibe `cpu_efectiva = 0.0`, lo que desplaza su temperatura objetivo hacia abajo, **simulando el enfriamiento progresivo del rack** tras el apagado del servidor. La telemetría ambiental continúa publicándose ininterrumpidamente, lo que permite al Frontend mostrar la curva de descenso de temperatura mientras el nodo está OFFLINE.
 
-**Comportamiento del Frontend ante esta inercia (ver §6.3):** cuando el nodo está OFFLINE, el Frontend recibe los eventos `telemetry_environment_received` y actualiza `temp` y `humidity` en las métricas del nodo (para mostrar la temperatura actual del rack y evaluar el desbloqueo del botón de recuperación), pero **no agrega esos puntos al historial** de la gráfica (evita trazar una línea "fantasma" congelada).
+**Comportamiento del Frontend ante esta inercia (ver §7.3):** cuando el nodo está OFFLINE, el Frontend recibe los eventos `telemetry_environment_received` y actualiza `temp` y `humidity` en las métricas del nodo (para mostrar la temperatura actual del rack y evaluar el desbloqueo del botón de recuperación), pero **no agrega esos puntos al historial** de la gráfica (evita trazar una línea "fantasma" congelada).
 
 ---
 
-### 3.4 Guardia Anti Fan-out — Cláusula de Identidad de Nodo
+### 4.4 Guardia Anti Fan-out — Cláusula de Identidad de Nodo
 
 Todos los agentes de un rack suscriben al **mismo tópico** `dc/control/zona/{Z}/rack/{R}`. Sin filtrado, un comando `hard_shutdown` dirigido a N1 sería ejecutado por N2, N3, etc. del mismo rack.
 
@@ -167,7 +243,7 @@ Solo `set_hvac_mode` omite la guardia, ya que opera sobre el rack completo y deb
 
 ---
 
-### 3.5 Patrón BMC — Apagado Lógico sin Suicidio de Contenedor
+### 4.5 Patrón BMC — Apagado Lógico sin Suicidio de Contenedor
 
 El **Patrón BMC** (Bare-Metal Container) es la solución adoptada para mantener vivo el listener MQTT durante un `hard_shutdown`, garantizando que el comando `start_node` siempre pueda ser recibido.
 
@@ -231,7 +307,7 @@ El archivo `.env` (con la IP del broker MQTT y configuración de zona) fue asegu
 
 ---
 
-### 3.6 Variables de entorno (`config.env.example`)
+### 4.6 Variables de entorno (`config.env.example`)
 
 | Variable | Valor por defecto | Descripción |
 |---|---|---|
@@ -248,7 +324,7 @@ El archivo `.env` (con la IP del broker MQTT y configuración de zona) fue asegu
 
 ---
 
-## 4. Capa Middleware — Broker MQTT
+## 5. Capa Middleware — Broker MQTT
 
 Eclipse Mosquitto 2 actúa como intermediario de mensajes. No tiene lógica de negocio: su único rol es recibir mensajes publicados en un tópico y distribuirlos a todos los suscriptores de ese tópico.
 
@@ -271,13 +347,13 @@ Mosquitto está configurado para escuchar en `0.0.0.0:1883`, lo que lo hace acce
 
 ---
 
-## 5. Capa Backend — Control Plane
+## 6. Capa Backend — Control Plane
 
 **Directorio:** `Aplicacion/Back-End/backend_SEDCM/src/`
 
 Es el núcleo del sistema. Recibe toda la telemetría, aplica las reglas de operación, persiste datos en PostgreSQL, despacha comandos y transmite el estado al frontend en tiempo real.
 
-### 5.1 Punto de entrada — `app.ts`
+### 6.1 Punto de entrada — `app.ts`
 
 Archivo que inicia el sistema. Coordina en orden:
 1. Carga de configuración (`config/env.ts`)
@@ -290,7 +366,7 @@ Archivo que inicia el sistema. Coordina en orden:
 
 ---
 
-### 5.2 Configuración — `config/env.ts`
+### 6.2 Configuración — `config/env.ts`
 
 Centraliza todas las variables de entorno con valores por defecto seguros. Define el tipo `AppEnv` con:
 - `PORT`: puerto HTTP (default: 3000)
@@ -301,7 +377,7 @@ Centraliza todas las variables de entorno con valores por defecto seguros. Defin
 
 ---
 
-### 5.3 Pipeline de ingesta — `mqtt/subscriptions.ts`
+### 6.3 Pipeline de ingesta — `mqtt/subscriptions.ts`
 
 Es el módulo más importante del backend. Orquesta el flujo completo desde que llega un mensaje MQTT hasta que se dispara una acción.
 
@@ -322,7 +398,7 @@ Es el módulo más importante del backend. Orquesta el flujo completo desde que 
 
 ---
 
-### 5.4 Parseo de tópicos — `mqtt/topic-parser.ts`
+### 6.4 Parseo de tópicos — `mqtt/topic-parser.ts`
 
 Valida y extrae metadatos de los tópicos MQTT.
 
@@ -332,7 +408,7 @@ Valida y extrae metadatos de los tópicos MQTT.
 
 ---
 
-### 5.5 Validación — `ingest/validators/`
+### 6.5 Validación — `ingest/validators/`
 
 Dos validadores según el tipo de telemetría:
 
@@ -347,7 +423,7 @@ Dos validadores según el tipo de telemetría:
 
 ---
 
-### 5.6 Normalización — `ingest/normalizers/`
+### 6.6 Normalización — `ingest/normalizers/`
 
 Transforma la telemetría validada al formato interno del sistema y detecta eventos fuera de orden.
 
@@ -355,7 +431,7 @@ Transforma la telemetría validada al formato interno del sistema y detecta even
 
 ---
 
-### 5.7 Deduplicación — `ingest/dedupe/dedupe-key.ts`
+### 6.7 Deduplicación — `ingest/dedupe/dedupe-key.ts`
 
 Genera una clave única por mensaje combinando: `topic | zona | rack | nodo | timestamp | SHA256(payload)`.
 
@@ -365,7 +441,7 @@ Genera una clave única por mensaje combinando: `topic | zona | rack | nodo | ti
 
 ---
 
-### 5.8 Motor de reglas — `rules/rules-engine.ts`
+### 6.8 Motor de reglas — `rules/rules-engine.ts`
 
 Evalúa las métricas y decide el estado de salud de nodos y racks.
 
@@ -392,7 +468,7 @@ Si `cpu_usage_pct ≥ 100` Y `net_rx_bytes_sec = 0` Y `net_tx_bytes_sec = 0` al 
 
 ---
 
-### 5.9 Despacho de comandos — `commands/command-dispatcher.ts`
+### 6.9 Despacho de comandos — `commands/command-dispatcher.ts`
 
 Genera, publica y audita los comandos de mitigación.
 
@@ -421,7 +497,7 @@ Cada comando se registra en `audit_command_log` con estado `PENDING` y se transm
 
 ---
 
-### 5.10 Monitor offline — `rules/offline-monitor.ts`
+### 6.10 Monitor offline — `rules/offline-monitor.ts`
 
 Proceso paralelo que se ejecuta cada 10 segundos (configurable). En cada barrido:
 1. Calcula el corte de tiempo: `ahora − 30 segundos`.
@@ -433,7 +509,7 @@ Un nodo que recupera telemetría vuelve automáticamente a `Normal` en la siguie
 
 ---
 
-### 5.11 Manejador de ACKs — `mqtt/ack-handler.ts`
+### 6.11 Manejador de ACKs — `mqtt/ack-handler.ts`
 
 Procesa las confirmaciones que llegan por `dc/ack/zona/{Z}/rack/{R}`:
 1. Valida el payload JSON (`{command_id, status, timestamp_ack}`).
@@ -442,7 +518,7 @@ Procesa las confirmaciones que llegan por `dc/ack/zona/{Z}/rack/{R}`:
 
 ---
 
-### 5.12 API REST y Protección Anti-Spam — `bootstrap/http.ts`
+### 6.12 API REST y Protección Anti-Spam — `bootstrap/http.ts`
 
 Servidor HTTP **nativo de Node.js** (sin Express ni frameworks externos). Expone endpoints de lectura y un endpoint de comando manual con validación de doble capa.
 
@@ -500,7 +576,7 @@ La lista de `statuses` es parametrizable (`ANY($3::text[])`), lo que permite al 
 
 ---
 
-### 5.13 WebSocket — `realtime/ws-server.ts`
+### 6.13 WebSocket — `realtime/ws-server.ts`
 
 Mantiene conexiones WebSocket con el frontend en `ws://localhost:3000/ws`. Cuando ocurre cualquier evento relevante, hace broadcast a todos los clientes conectados.
 
@@ -518,7 +594,7 @@ Mantiene conexiones WebSocket con el frontend en `ws://localhost:3000/ws`. Cuand
 
 ---
 
-### 5.14 Repositorios — `repositories/`
+### 6.14 Repositorios — `repositories/`
 
 Capa de acceso a datos. Toda interacción con PostgreSQL pasa por aquí.
 
@@ -531,41 +607,40 @@ Capa de acceso a datos. Toda interacción con PostgreSQL pasa por aquí.
 
 ---
 
-## 6. Capa Frontend — Dashboard React
+## 7. Capa Frontend — Dashboard React
 
 **Directorio:** `Aplicacion/Front-End/SEDCMFront/src/`
 
-### 6.1 Árbol de componentes
+### 7.1 Árbol de componentes
+
+El dashboard está compuesto por cinco componentes activos. Los controles manuales de HVAC y extractores fueron eliminados — el sistema los gestiona exclusivamente de forma automática desde el motor de reglas del backend.
 
 ```
 App.jsx  (estado global + WebSocket + REST)
-├── ZoneSelector.jsx    (sidebar: lista de zonas)
-├── LogsPanel.jsx       (sidebar: log de eventos en tiempo real)
-├── RackList.jsx        (grid de cards de racks)  — o bien:
-├── RackDetail.jsx      (vista detallada de un rack)
-│   └── LineChart.jsx   (gráfica SVG de historial de métrica)
-└── ZoneControls.jsx    (panel derecho de controles)
-    ├── HVACControl.jsx     (indicador de modo HVAC — solo lectura)
-    └── ExtractorControl.jsx (indicador visual de extractores)
+├── ZoneSelector.jsx    (sidebar izquierdo: botones de selección de zona)
+├── LogsPanel.jsx       (sidebar izquierdo: log de eventos en tiempo real)
+├── RackList.jsx        (vista principal: grid de cards de racks con estado de color)
+└── RackDetail.jsx      (vista detallada de un rack seleccionado)
+    └── LineChart.jsx   (gráfica SVG de historial de métrica)
 ```
 
 ---
 
-### 6.2 `App.jsx` — Componente raíz y estado global
+### 7.2 `App.jsx` — Componente raíz y estado global
 
 Es el cerebro del frontend. Contiene todo el estado global y gestiona las conexiones con el backend.
 
 **Estado principal:**
 - `zones`: árbol completo del inventario (zonas → racks → servidores con métricas e historial)
 - `selectedZone` / `selectedRack`: navegación actual del usuario
-- `hvacModeByRack`: mapa `{rack_id: "cooling"|"humidify"|"dehumidify"|"off"}` actualizado por WebSocket
 - `logs`: últimos 200 eventos para el panel de logs
 - `wsStatus`: estado de la conexión WebSocket (`"conectando"` | `"conectado"` | `"reconectando"` | `"error"`)
-- `recoveringNodes`: Set de IDs de nodos con un comando `start_node` en vuelo (ver §6.3)
+- `recoveringNodes`: Set de IDs de nodos con un comando `start_node` en vuelo (ver §7.3)
+- `recoveryErrors`: mapa `{ node_id: mensaje_de_error }` para mostrar mensajes de fallo tras timeout
 
 **Al iniciar la aplicación:**
-1. Hace GET `/api/v1/inventory` y construye el árbol de zonas en `buildZonesFromInventory()`.
-2. Abre conexión WebSocket y empieza a recibir eventos en tiempo real.
+1. Ejecuta `tryFetch()` con auto-retry cada 5 s hasta que el backend responda (ver §7.4 — Auto-Reconnect).
+2. Una vez cargado el inventario, abre conexión WebSocket y empieza a recibir eventos en tiempo real.
 3. Al conectar el WebSocket, carga los últimos 50 comandos de `/api/v1/audit/commands` para poblar el log inicial.
 
 **Al seleccionar un rack:**
@@ -594,7 +669,7 @@ Cuando llega `telemetry_environment_received` y el nodo está OFFLINE:
 
 ---
 
-### 6.3 Estado Transaccional — `recoveringNodes` y el Botón de Recuperación
+### 7.3 Estado Transaccional — `recoveringNodes` y el Botón de Recuperación
 
 El botón **"Recuperar Nodo"** implementa un **patrón de actualización optimista** para evitar doble clic y dar retroalimentación visual inmediata al operador.
 
@@ -609,6 +684,7 @@ sendCommand({ action: "start_node", target_id: server.id, … })
 ¿Respuesta OK (202)?
    SÍ → setRecoveringNodes(prev => new Set([...prev, target_id]))
          Botón cambia a "Recuperando…" (disabled)
+         Se inicia un timer de 10 s (timeout optimista — ver §7.4)
    NO → pushLog({ level: "warn", text: "Error al despachar…" })
          Botón permanece habilitado
 
@@ -619,6 +695,7 @@ Llega evento WebSocket: node_status_changed { new_status: "Normal" }
          ↓
 if (data.new_status !== "OFFLINE"):
    setRecoveringNodes(prev → prev.delete(data.node_id))
+   clearTimeout(recoveryTimer)   ← cancela el timer de 10 s
          Botón desaparece (el nodo ya no está OFFLINE)
 ```
 
@@ -644,24 +721,93 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
 
 ---
 
-### 6.4 Componentes de presentación
+### 7.4 Mecánicas de Resiliencia del Frontend
+
+El dashboard implementa dos mecánicas complementarias para mantener la experiencia operativa incluso cuando el backend o los nodos no responden inmediatamente.
+
+#### Auto-Reconnect Silencioso
+
+El frontend nunca muestra una pantalla de error estática. Ante cualquier fallo de conexión, se reconecta automáticamente de forma transparente al operador.
+
+**Fase 1 — Carga inicial del inventario (antes de abrir WebSocket):**
+
+`App.jsx` ejecuta `tryFetch()` en un loop con `setTimeout` de 5 segundos:
+
+```javascript
+async function tryFetch() {
+  try {
+    const r = await fetch(`${API}/api/v1/inventory`)
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    // éxito → construye árbol de zonas y abre WebSocket
+  } catch (err) {
+    pushLog({ level: 'warn', text: `Backend no disponible — reintentando en 5 s…` })
+    retryTimer = setTimeout(tryFetch, 5000)   // ← reintenta silenciosamente
+  }
+}
+```
+
+Mientras no haya inventario, la UI muestra "Conectando al backend… Reintentando automáticamente cada 5 s". En cuanto el backend responde, la transición al dashboard es automática sin recarga de página.
+
+**Fase 2 — Reconexión del WebSocket tras pérdida de conexión:**
+
+Si el WebSocket se cierra (backend reiniciado, corte de red), el manejador `ws.onclose` programa una nueva conexión en 3 segundos:
+
+```javascript
+ws.onclose = () => {
+  setWsStatus('reconectando')
+  setTimeout(connect, 3000)   // ← reconexión automática en 3 s
+}
+```
+
+Al reconectarse, el `ws.onopen` ejecuta automáticamente un re-fetch de `/api/v1/inventory` para sincronizar cualquier cambio de estructura que se haya producido mientras el WebSocket estaba caído (por ejemplo, nuevas zonas conectadas por compañeros de clase).
+
+#### Timeout Optimista de 10 Segundos para `start_node`
+
+Cuando el operador hace clic en "Recuperar Nodo", el botón pasa al estado "Recuperando…" y se inicia un timer de 10 segundos en paralelo. Este mecanismo previene el bug de "Recuperando… infinito" que ocurre cuando el contenedor edge está inalcanzable o el agente no puede ejecutar el `start_node`.
+
+```javascript
+// En sendCommand() tras recibir HTTP 202
+const timerId = setTimeout(() => {
+  // Si el nodo sigue en recoveringNodes después de 10 s, cancela la espera
+  setRecoveringNodes(prev => {
+    if (!prev.has(target_id)) return prev   // ya se recuperó, no hacer nada
+    const next = new Set(prev)
+    next.delete(target_id)
+    return next
+  })
+  // Muestra el mensaje de error en la UI del nodo
+  setRecoveryErrors(prev => ({
+    ...prev,
+    [target_id]: 'Error: Servidor inalcanzable (Revisar contenedor)'
+  }))
+}, 10000)
+recoveryTimersRef.current[target_id] = timerId
+```
+
+**Flujo de los dos caminos posibles:**
+
+| Camino | Qué ocurre |
+|---|---|
+| **Recuperación exitosa (< 10 s):** el agente ejecuta `start_node` → el nodo vuelve a publicar → `node_status_changed { new_status: "Normal" }` llega por WebSocket → el nodo se elimina de `recoveringNodes` y `clearTimeout` cancela el timer antes de que dispare. |
+| **Fallo (≥ 10 s):** el timer dispara → el nodo se saca de `recoveringNodes` → se registra el error en `recoveryErrors` → la UI muestra el mensaje de error en el card del nodo y el botón vuelve a habilitarse (si la temperatura lo permite). |
+
+El timer se cancela con `clearTimeout` también si el nodo entra en OFFLINE nuevamente antes de los 10 s, para evitar actualizaciones de estado contradictorias.
+
+---
+
+### 7.5 Componentes de presentación
 
 | Componente | Props principales | Propósito |
 |---|---|---|
 | `ZoneSelector` | `zones, onSelect, selected` | Botones de selección de zona en el sidebar |
 | `RackList` | `zone, onSelect` | Grid de cards de racks con estado de color (Normal/Warning/Crítico) |
-| `RackDetail` | `rack, onBack, onCommand, recoveringNodes` | Vista detallada: grid de servidores + historial expandible + botón de recuperación |
-| `ZoneControls` | `zone, controls, onChange, selectedRack, hvacMode` | Contenedor del panel derecho |
-| `HVACControl` | `rack, hvacMode` | Indicador de modo HVAC actual (solo lectura, controlado automáticamente por el Motor de Reglas) |
-| `ExtractorControl` | `value, simulate` | Indicador visual de uso de extractores |
+| `RackDetail` | `rack, onBack, onCommand, recoveringNodes, recoveryErrors` | Vista detallada: grid de servidores + historial expandible + botón de recuperación |
 | `LogsPanel` | `logs` | Lista de eventos con auto-scroll y colores por nivel |
 | `LineChart` | `data, metric, width, height` | Gráfica SVG con curva Bézier, área rellena y tooltip |
 
-> **Nota sobre HVACControl:** El HVAC se activa **automáticamente** según las reglas del Motor de Reglas del backend. El componente es un indicador de solo lectura. No hay botones de control manual de HVAC.
-
 ---
 
-## 7. Flujo de extremo a extremo
+## 8. Flujo de extremo a extremo
 
 ### Escenario A — Telemetría normal
 
@@ -702,7 +848,7 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
    → command-dispatcher publica hard_shutdown
    → escalation_event emitido por WebSocket (stage: hard_shutdown_selected)
 
-7. agent.py recibe hard_shutdown (Patrón BMC — ver §3.5)
+7. agent.py recibe hard_shutdown (Patrón BMC — ver §4.5)
    → Guardia: target_id == NODO_ID → se ejecuta
    → nodo.soft_reboot() — resetea CPU/RAM a estado base
    → _set_node_shutdown(True) — telemetría de nodo silenciada
@@ -719,8 +865,8 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
    → Publica en dc/control/zona/A/rack/A1
    → WebSocket emite command_published {action: "set_hvac_mode", mode: "cooling"}
 
-4. App.jsx recibe el evento → hvacModeByRack["A-A1"] = "cooling"
-5. HVACControl.jsx muestra: "Enfriamiento activo" (color azul)
+4. App.jsx recibe el evento → registra el comando en el LogsPanel
+5. El modo HVAC queda reflejado en el log de auditoría del dashboard
 
 6. agent.py recibe el comando en _ejecutar_comando
    → set_hvac_mode NO pasa por la guardia de node_id (es una acción de rack)
@@ -739,6 +885,7 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
 2. Operador hace clic
    → Frontend envía POST /api/v1/commands { action: "start_node", target_id: "N1", … }
    → Frontend agrega "N1" a recoveringNodes → botón cambia a "Recuperando…"
+   → Se inicia timer de 10 s (timeout optimista — ver §7.4)
 
 3. http.ts recibe la petición
    → validateManualCommandBody: OK
@@ -753,7 +900,7 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
    → Responde HTTP 409 { error: "command_already_pending", detail: "…" }
    → Frontend registra aviso en el LogsPanel (no duplica el comando)
 
-5. agent.py recibe start_node en dc/control/zona/A/rack/A1 (Patrón BMC — ver §3.5)
+5. agent.py recibe start_node en dc/control/zona/A/rack/A1 (Patrón BMC — ver §4.5)
    → Guardia: target_id=="N1" == NODO_ID → se ejecuta
    → nodo.soft_reboot() → CPU/RAM reseteados a ~15 %
    → _set_node_shutdown(False) → publicar_nodo() reanuda
@@ -769,17 +916,74 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
 
 8. Frontend recibe node_status_changed:
    → setRecoveringNodes → elimina "N1" del Set
+   → clearTimeout → cancela el timer de 10 s
    → health_status del nodo actualizado en el árbol de zonas
    → Botón "Recuperar Nodo" desaparece (el nodo ya no es OFFLINE)
 ```
 
 ---
 
-## 8. Base de Datos PostgreSQL
+## 9. Base de Datos PostgreSQL
 
-**Migraciones:** `Aplicacion/Back-End/backend_SEDCM/db/migrations/`
+**Directorio de migraciones:** `Aplicacion/Back-End/backend_SEDCM/db/migrations/`
 
-### Tablas principales
+### 9.1 Estrategia de Migraciones — La base de datos como código versionado
+
+En lugar de crear tablas a mano (ejecutando sentencias SQL en un cliente como pgAdmin cada vez que se levanta el entorno), SEDCM gestiona el esquema de la base de datos mediante **archivos de migración numerados secuencialmente**.
+
+Cada archivo `.sql` en `db/migrations/` es un **paso incremental e irreversible** que construye sobre el anterior. Al arrancar el backend, las migraciones se ejecutan en orden automáticamente, asegurando que cualquier entorno (local, Docker, PC de compañero) tenga exactamente el mismo esquema.
+
+| Migración | Contenido |
+|---|---|
+| `001_inventory_telemetry.sql` | Crea las tablas base: zonas, racks, nodos e inventario de telemetría |
+| `002_inventory_status_columns.sql` | Agrega columnas de estado (`health_status`, `environment_status`, `last_seen_at`) |
+| `003_command_audit_log.sql` | Crea la tabla `audit_command_log` para registrar todos los comandos y sus ACKs |
+| `004_ack_status_acked.sql` | Agrega el valor `ACKED` al enum de estados de ACK |
+| `005_offline_status.sql` | Agrega el valor `OFFLINE` al enum de estados de nodo |
+| `006_start_node_action.sql` | Agrega `start_node` como acción válida en la bitácora de auditoría |
+
+**Ventaja clave para un equipo:** si un compañero conecta su PC al sistema meses después, no necesita instrucciones manuales sobre cómo configurar la base de datos. Basta con `docker compose up` y las 6 migraciones se aplican automáticamente en orden, construyendo el esquema completo desde cero.
+
+---
+
+### 9.2 Persistencia vs. Estado en Tiempo Real — Dos fuentes de verdad con propósitos distintos
+
+Este es uno de los conceptos más importantes del sistema y con frecuencia genera confusión.
+
+**Persistencia — PostgreSQL (disco)**
+
+Las tablas `telemetry_node` y `telemetry_environment` son **series de tiempo inmutables**. Cada mensaje MQTT que llega al backend genera un nuevo registro. Estos datos sobreviven reinicios, permiten consultar el historial de las últimas horas y son la fuente del endpoint `/api/v1/telemetry/node`.
+
+```
+Un nodo publica → el backend inserta → queda en disco para siempre
+(Ejemplo: 86 400 filas por día por nodo a 1 mensaje cada 5 s)
+```
+
+**Estado en tiempo real — RAM del backend + WebSocket**
+
+El estado actual del sistema (`health_status`, `environment_status`, `last_seen_at`) vive en la **memoria RAM del proceso backend** y se actualiza con cada telemetría recibida. Cuando el frontend necesita el estado actual, lo obtiene por WebSocket (eventos `node_status_changed`, `rack_status_changed`), no consultando la base de datos.
+
+```
+Telemetría llega → rules-engine evalúa → actualiza estado en RAM
+                                       → broadcastRealtimeEvent → WebSocket → Frontend
+                                       (PostgreSQL NO se consulta para este camino)
+```
+
+**¿Cuándo se usa cada una?**
+
+| Caso de uso | Fuente |
+|---|---|
+| Ver el CPU actual de un nodo en el dashboard | WebSocket (RAM) |
+| Ver el historial de CPU de las últimas 2 horas | PostgreSQL (REST `/api/v1/telemetry/node`) |
+| Saber si un nodo está OFFLINE ahora mismo | WebSocket (RAM) |
+| Saber cuántos comandos se han emitido esta semana | PostgreSQL (REST `/api/v1/audit/commands`) |
+| Cargar el historial al abrir un rack por primera vez | PostgreSQL → REST → merge con datos WS en vivo |
+
+El Frontend combina ambas fuentes: al seleccionar un rack, hace un fetch REST a PostgreSQL para obtener los últimos 60 puntos históricos y los fusiona con los puntos que ya llegaron en vivo por WebSocket, sin duplicar.
+
+---
+
+### 9.3 Tablas principales
 
 | Tabla | Propósito |
 |---|---|
@@ -791,7 +995,7 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
 | `telemetry_environment` | Serie de tiempo de ambiente por rack (temp °C, humedad %). |
 | `audit_command_log` | Registro de todos los comandos emitidos (manuales y automáticos), su payload MQTT y el resultado del ACK. |
 
-### Estados posibles
+### 9.4 Estados posibles
 
 | Estado | Significado |
 |---|---|
@@ -802,9 +1006,9 @@ La **temperatura del rack** se calcula como el promedio de `metrics.temp` de tod
 
 ---
 
-## 9. Topología Distribuida LAN y Retos de Concurrencia Superados
+## 10. Topología Distribuida LAN y Retos de Concurrencia Superados
 
-### 9.1 Topología final
+### 10.1 Topología final
 
 El sistema opera en red LAN con dos tipos de nodos:
 
@@ -830,7 +1034,7 @@ Clonan el repositorio standalone `JPalexo/sedcm-edge-agent`, crean un `.env` con
 
 ---
 
-### 9.2 Reto 1 — Fan-out sin filtrado en MQTT
+### 10.2 Reto 1 — Fan-out sin filtrado en MQTT
 
 **Síntoma:** Con 2 nodos por rack, un `hard_shutdown` para N1 también silenciaba a N2. Ambos nodos del rack aparecían OFFLINE y el rack completo mostraba `0.0°C` ("nodo fantasma").
 
@@ -846,13 +1050,13 @@ if action in NODE_LEVEL_ACTIONS and target_type == "nodo" and target_id != NODO_
     return
 ```
 
-> El fix original también incluía `MY_CONTAINER_NAME` y llamadas al Docker SDK. Esas partes fueron eliminadas en el fix **Patrón BMC** (ver §3.5): `hard_shutdown` y `start_node` son ahora lógicos y no necesitan conocer el nombre del contenedor.
+> El fix original también incluía `MY_CONTAINER_NAME` y llamadas al Docker SDK. Esas partes fueron eliminadas en el fix **Patrón BMC** (ver §4.5): `hard_shutdown` y `start_node` son ahora lógicos y no necesitan conocer el nombre del contenedor.
 
 **Resultado:** Cada agente solo ejecuta los comandos que le corresponden. `set_hvac_mode` no requiere guardia porque opera sobre el rack completo y debe ejecutarse en todos los agentes del rack.
 
 ---
 
-### 9.3 Reto 2 — Colisión de Clave Primaria en PostgreSQL
+### 10.3 Reto 2 — Colisión de Clave Primaria en PostgreSQL
 
 **Síntoma:** Al conectar una Zona B con NODE_IDs `N1-N4`, los racks de Zona B aparecían vacíos y los de Zona A perdían sus nodos intermitentemente.
 
@@ -868,7 +1072,7 @@ La Zona A (servidor central) conserva N1–N4. Cada zona invitada usa IDs único
 
 ---
 
-### 9.4 Convención de nombres
+### 10.4 Convención de nombres
 
 | Ubicación | Patrón `container_name` | Patrón `NODE_ID` | Ejemplo |
 |---|---|---|---|
@@ -877,7 +1081,7 @@ La Zona A (servidor central) conserva N1–N4. Cada zona invitada usa IDs único
 
 ---
 
-## 10. Referencia rápida — ¿Dónde está cada cosa?
+## 11. Referencia rápida — ¿Dónde está cada cosa?
 
 | Necesito cambiar... | Archivo |
 |---|---|
@@ -888,6 +1092,8 @@ La Zona A (servidor central) conserva N1–N4. Cada zona invitada usa IDs único
 | Lógica de escalación de comandos | `src/commands/command-dispatcher.ts` |
 | Ventana de anti-spam del botón de recuperación | `src/bootstrap/http.ts` → `windowSeconds: 30` |
 | Umbral de temperatura para habilitar recuperación | `Aplicacion/Front-End/SEDCMFront/src/components/RackDetail.jsx` → `rackAmbientTemp <= 42` |
+| Timeout del botón "Recuperar Nodo" | `Aplicacion/Front-End/SEDCMFront/src/App.jsx` → `setTimeout(..., 10000)` |
+| Intervalo de reconexión WebSocket | `Aplicacion/Front-End/SEDCMFront/src/App.jsx` → `setTimeout(connect, 3000)` |
 | Endpoints de la API REST | `src/bootstrap/http.ts` |
 | Eventos WebSocket | `src/realtime/ws-server.ts` |
 | Consultas a la base de datos | `src/repositories/query.repository.ts` |
