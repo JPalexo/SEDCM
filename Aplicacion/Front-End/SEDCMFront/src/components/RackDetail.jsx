@@ -9,13 +9,15 @@ const METRICS = [
   { key: 'net',      label: 'Red'     },
 ]
 
-export default function RackDetail({ rack, onBack, onCommand, recoveringNodes = new Set() }) {
+export default function RackDetail({ rack, onBack, onCommand, recoveringNodes = new Set(), recoveryErrors = {} }) {
   const [metric, setMetric] = useState('cpu')
   const [expandedServer, setExpandedServer] = useState(null)
 
+  // Paso 2: usar rack.id como dependencia en lugar del objeto completo para que las
+  // actualizaciones de telemetría (que recrean rack) no reseteen el nodo seleccionado
   React.useEffect(() => {
     setExpandedServer(rack && rack.servers && rack.servers[0] ? rack.servers[0].id : null)
-  }, [rack])
+  }, [rack.id])
 
   // Temperatura ambiental del rack — todos los nodos del rack comparten la misma fuente ambiental,
   // por lo que temp se mantiene actualizada incluso cuando el nodo está OFFLINE
@@ -56,20 +58,27 @@ export default function RackDetail({ rack, onBack, onCommand, recoveringNodes = 
                 </div>
                 <div className="server-actions">
                   {isOffline && (
-                    <button
-                      className="recover-btn"
-                      disabled={!canRecover}
-                      title={
-                        isRecovering
-                          ? 'Comando de recuperación en progreso — esperando confirmación del nodo'
-                          : canRecover
-                          ? 'Enviar comando start_node al nodo'
-                          : `Rack a ${rackAmbientTemp.toFixed(1)}°C — espera enfriamiento (≤ 42°C)`
-                      }
-                      onClick={() => handleRecover(s)}
-                    >
-                      {isRecovering ? 'Recuperando…' : 'Recuperar Nodo'}
-                    </button>
+                    <div>
+                      <button
+                        className="recover-btn"
+                        disabled={!canRecover}
+                        title={
+                          isRecovering
+                            ? 'Comando de recuperación en progreso — esperando confirmación del nodo'
+                            : canRecover
+                            ? 'Enviar comando start_node al nodo'
+                            : `Rack a ${rackAmbientTemp.toFixed(1)}°C — espera enfriamiento (≤ 42°C)`
+                        }
+                        onClick={() => handleRecover(s)}
+                      >
+                        {isRecovering ? 'Recuperando…' : 'Recuperar Nodo'}
+                      </button>
+                      {recoveryErrors[s.id] && (
+                        <div style={{ color: 'var(--danger)', fontSize: '11px', marginTop: '4px', maxWidth: '160px' }}>
+                          {recoveryErrors[s.id]}
+                        </div>
+                      )}
+                    </div>
                   )}
                   <button
                     className="history-btn"

@@ -2,14 +2,11 @@ import React, { useEffect, useRef, useState } from 'react'
 import ZoneSelector from './components/ZoneSelector'
 import RackList from './components/RackList'
 import RackDetail from './components/RackDetail'
-import ZoneControls from './components/ZoneControls'
 import LogsPanel from './components/LogsPanel'
 
 const API = 'http://127.0.0.1:3000'
 const WS_URL = 'ws://127.0.0.1:3000/ws'
 
-// Convierte la respuesta de GET /api/v1/inventory a la estructura interna
-// que usan ZoneSelector, RackList y RackDetail.
 function buildZonesFromInventory(inventory) {
   return inventory.zones.map(z => ({
     id: z.zone_code,
@@ -35,11 +32,9 @@ function buildZonesFromInventory(inventory) {
   }))
 }
 
-// Mapea métricas del backend (unidades reales) a las keys que usan los componentes
 function mapNodeMetrics(backendMetrics) {
   return {
     cpu: Number((backendMetrics.cpu_usage_pct ?? 0).toFixed(1)),
-    // ram: MB absolutos → % asumiendo 16 GB máx
     ram: Number(((backendMetrics.ram_usage_mb ?? 0) / 16384 * 100).toFixed(1)),
     net: Number((((backendMetrics.net_rx_bytes_sec ?? 0) + (backendMetrics.net_tx_bytes_sec ?? 0)) / 125000).toFixed(1))
   }
@@ -52,7 +47,6 @@ function mapEnvMetrics(backendEnv) {
   }
 }
 
-// Formatea un evento WebSocket en entrada de log legible
 function eventToLog(event) {
   const { type, data } = event
   const t = Date.now()
@@ -82,21 +76,24 @@ function eventToLog(event) {
 export default function App() {
   const [zones, setZones] = useState([])
   const [loading, setLoading] = useState(true)
-  const [backendError, setBackendError] = useState(null)
   const [wsStatus, setWsStatus] = useState('conectando')
 
   const [selectedZone, setSelectedZone] = useState(null)
   const [selectedRack, setSelectedRack] = useState(null)
-  const [zoneControls, setZoneControls] = useState({})
   const [logs, setLogs] = useState([])
-  // Mapa rackKey → último modo HVAC conocido, actualizado por eventos command_published
-  const [hvacModeByRack, setHvacModeByRack] = useState({})
+
   // Nodos con start_node en vuelo — se limpian al recibir node_status_changed a estado activo
   const [recoveringNodes, setRecoveringNodes] = useState(new Set())
+  // Mensajes de error por timeout de recuperación, keyed por node_id
+  const [recoveryErrors, setRecoveryErrors] = useState({})
 
   const wsRef = useRef(null)
   const zonesRef = useRef(zones)
   zonesRef.current = zones
+  // Timers de timeout para start_node, keyed por node_id
+  const recoveryTimersRef = useRef({})
+  // Distingue primera conexión WS de reconexiones
+  const wsFirstConnectRef = useRef(true)
 
   function pushLog(entry) {
     setLogs(prev => [entry, ...prev].slice(0, 200))
@@ -114,6 +111,20 @@ export default function App() {
         pushLog({ t: Date.now(), level: 'info', text: `Comando '${action}' despachado → ${String(data.command_id).slice(0, 8)}…` })
         if (action === 'start_node') {
           setRecoveringNodes(prev => new Set([...prev, target_id]))
+          setRecoveryErrors(prev => { const n = { ...prev }; delete n[target_id]; return n })
+
+          // Paso 4: timeout de 10 s — si el nodo sigue OFFLINE, muestra error
+          const timerId = setTimeout(() => {
+            setRecoveringNodes(prev => {
+              if (!prev.has(target_id)) return prev
+              const next = new Set(prev)
+              next.delete(target_id)
+              return next
+            })
+            setRecoveryErrors(prev => ({ ...prev, [target_id]: 'Error: Servidor inalcanzable (Revisar contenedor)' }))
+            delete recoveryTimersRef.current[target_id]
+          }, 10000)
+          recoveryTimersRef.current[target_id] = timerId
         }
       } else {
         pushLog({ t: Date.now(), level: 'warn', text: `Error al despachar '${action}': ${data.detail || data.error || res.status}` })
@@ -123,25 +134,33 @@ export default function App() {
     }
   }
 
-  // ── Carga inicial: GET /api/v1/inventory ─────────────────────────────────
+  // ── Paso 3: Carga inicial con auto-retry cada 5 s hasta que el backend responda ──
   useEffect(() => {
-    fetch(`${API}/api/v1/inventory`)
-      .then(r => {
+    let cancelled = false
+    let retryTimer = null
+
+    async function tryFetch() {
+      try {
+        const r = await fetch(`${API}/api/v1/inventory`)
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        return r.json()
-      })
-      .then(data => {
+        const data = await r.json()
+        if (cancelled) return
         const built = buildZonesFromInventory(data)
         setZones(built)
-        setZoneControls(Object.fromEntries(built.map(z => [z.id, { hvac: 50, extractor: 50 }])))
         pushLog({ t: Date.now(), level: 'info', text: `Inventario cargado: ${built.length} zona(s), ${built.reduce((s, z) => s + z.racks.length, 0)} rack(s)` })
         setLoading(false)
-      })
-      .catch(err => {
-        setBackendError(err.message)
-        setLoading(false)
-        pushLog({ t: Date.now(), level: 'critical', text: `Error conectando al backend: ${err.message}` })
-      })
+      } catch (err) {
+        if (cancelled) return
+        pushLog({ t: Date.now(), level: 'warn', text: `Backend no disponible — reintentando en 5 s… (${err.message})` })
+        retryTimer = setTimeout(tryFetch, 5000)
+      }
+    }
+
+    tryFetch()
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+    }
   }, [])
 
   // ── WebSocket: actualizaciones en tiempo real ─────────────────────────────
@@ -155,7 +174,21 @@ export default function App() {
       ws.onopen = () => {
         setWsStatus('conectado')
         pushLog({ t: Date.now(), level: 'info', text: 'WebSocket conectado al backend' })
-        // Cargar historial de auditoría solo una vez al conectar
+
+        // Paso 3: en reconexión, re-fetch inventario para sincronizar estructura
+        if (!wsFirstConnectRef.current) {
+          fetch(`${API}/api/v1/inventory`)
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+              if (!data) return
+              const built = buildZonesFromInventory(data)
+              setZones(built)
+              pushLog({ t: Date.now(), level: 'info', text: 'Inventario actualizado tras reconexión' })
+            })
+            .catch(() => {})
+        }
+        wsFirstConnectRef.current = false
+
         fetch(`${API}/api/v1/audit/commands?limit=50`)
           .then(r => r.ok ? r.json() : { commands: [] })
           .then(data => {
@@ -177,7 +210,6 @@ export default function App() {
 
         const { type, data } = event
 
-        // Actualizar métricas de nodo
         if (type === 'telemetry_node_received') {
           const { dc_zone, dc_rack, node_id } = data.metadata
           const nodeMetrics = mapNodeMetrics(data.metrics)
@@ -201,7 +233,6 @@ export default function App() {
           }))
         }
 
-        // Actualizar métricas ambientales del rack (temp + humidity a todos los nodos del rack)
         if (type === 'telemetry_environment_received') {
           const { dc_zone, dc_rack } = data.metadata
           const envMetrics = mapEnvMetrics(data.environment)
@@ -215,8 +246,6 @@ export default function App() {
                   ...r,
                   servers: r.servers.map(s => {
                     const merged = { ...s.metrics, ...envMetrics }
-                    // Nodo OFFLINE: actualiza temp/humidity para el indicador de HVAC y el botón
-                    // de recuperación, pero NO agrega puntos al historial (evita trazar línea congelada)
                     if (s.health_status === 'OFFLINE') {
                       return { ...s, metrics: merged }
                     }
@@ -229,15 +258,24 @@ export default function App() {
           }))
         }
 
-        // Actualizar health_status del nodo
         if (type === 'node_status_changed') {
-          // Si el nodo sale de OFFLINE, ya no está en proceso de recuperación
           if (data.new_status !== 'OFFLINE') {
             setRecoveringNodes(prev => {
               if (!prev.has(data.node_id)) return prev
               const next = new Set(prev)
               next.delete(data.node_id)
               return next
+            })
+            // Paso 4: limpiar timer y error al recuperarse antes del timeout
+            if (recoveryTimersRef.current[data.node_id]) {
+              clearTimeout(recoveryTimersRef.current[data.node_id])
+              delete recoveryTimersRef.current[data.node_id]
+            }
+            setRecoveryErrors(prev => {
+              if (!(data.node_id in prev)) return prev
+              const n = { ...prev }
+              delete n[data.node_id]
+              return n
             })
           }
 
@@ -252,8 +290,6 @@ export default function App() {
                   servers: r.servers.map(s => {
                     if (s.id !== data.node_id) return s
                     const base = { ...s, health_status: data.new_status }
-                    // Al pasar a OFFLINE: zerear cpu/ram/net y agregar punto final al historial
-                    // para que la gráfica muestre la caída antes de detenerse
                     if (data.new_status === 'OFFLINE') {
                       const zeroedMetrics = { ...s.metrics, cpu: 0, ram: 0, net: 0 }
                       base.metrics = zeroedMetrics
@@ -267,7 +303,6 @@ export default function App() {
           }))
         }
 
-        // Actualizar environment_status del rack
         if (type === 'rack_status_changed') {
           setZones(prev => prev.map(z => {
             if (z.zone_code !== data.zone_code) return z
@@ -280,13 +315,6 @@ export default function App() {
           }))
         }
 
-        // Registrar modo HVAC cuando el sistema despacha set_hvac_mode automáticamente
-        if (type === 'command_published' && data.action === 'set_hvac_mode' && data.mode) {
-          const rackKey = `${data.zone_code}-${data.rack_code}`
-          setHvacModeByRack(prev => ({ ...prev, [rackKey]: data.mode }))
-        }
-
-        // Agregar al panel de logs
         const logEntry = eventToLog(event)
         if (logEntry) pushLog(logEntry)
       }
@@ -326,7 +354,6 @@ export default function App() {
         envRes.ok ? envRes.json() : { items: [] }
       ])
 
-      // Agrupar historial de nodo por node_id, ordenado de más antiguo a más reciente
       const nodeHistory = {}
       for (const item of [...(nodeData.items || [])].reverse()) {
         if (!nodeHistory[item.node_id]) nodeHistory[item.node_id] = []
@@ -341,13 +368,11 @@ export default function App() {
         })
       }
 
-      // Historial ambiental compartido para todos los nodos del rack, ordenado de más antiguo a más reciente
       const envHistory = [...(envData.items || [])].reverse().map(item => ({
         t: new Date(item.event_time).getTime(),
         ...mapEnvMetrics({ temperature_c: item.temperature_c, humidity_pct: item.humidity_pct })
       }))
 
-      // Fusionar historial en el estado — solo para el rack seleccionado
       setZones(prev => prev.map(z => {
         if (z.zone_code !== rack.zone_code) return z
         return {
@@ -357,18 +382,14 @@ export default function App() {
             return {
               ...r,
               servers: r.servers.map(s => {
-                // Combinar puntos históricos de nodo y ambiente por timestamp
                 const nHist = nodeHistory[s.id] || []
-                // Para cada punto de nodo, buscar el punto ambiental más cercano
                 const merged = nHist.map(np => {
                   const closest = envHistory.reduce((best, ep) =>
                     Math.abs(ep.t - np.t) < Math.abs((best?.t ?? Infinity) - np.t) ? ep : best
                   , null)
                   return { ...np, ...(closest ? { temp: closest.temp, humidity: closest.humidity } : {}) }
                 })
-                // Si no hay historial de nodo pero sí ambiental, usar solo ambiental
                 const baseHistory = merged.length ? merged : envHistory.map(ep => ({ ...s.metrics, ...ep }))
-                // Fusionar con lo que ya tiene (puntos en vivo del WS), sin duplicar por timestamp
                 const existing = s.metricsHistory || []
                 const existingTs = new Set(existing.map(p => p.t))
                 const combined = [...baseHistory.filter(p => !existingTs.has(p.t)), ...existing]
@@ -385,14 +406,9 @@ export default function App() {
     }
   }
 
-  // Limpiar rack seleccionado al cambiar de zona
   useEffect(() => {
     if (selectedZone) setSelectedRack(null)
   }, [selectedZone])
-
-  function updateZoneControls(zoneId, controls) {
-    setZoneControls(prev => ({ ...prev, [zoneId]: controls }))
-  }
 
   const wsIndicatorClass = wsStatus === 'conectado' ? 'ws-ok' : wsStatus === 'conectando' ? 'ws-wait' : 'ws-err'
 
@@ -400,8 +416,9 @@ export default function App() {
     return (
       <div className="app-root">
         <header className="topbar"><h1>SEDCM — Monitor Datacenter</h1></header>
-        <div className="container" style={{ justifyContent: 'center', alignItems: 'center' }}>
+        <div className="container" style={{ justifyContent: 'center', alignItems: 'center', flexDirection: 'column', gap: '8px' }}>
           <div style={{ color: '#aaa', fontSize: '1.1rem' }}>Conectando al backend…</div>
+          <div style={{ color: 'var(--muted)', fontSize: '0.82rem' }}>Reintentando automáticamente cada 5 s</div>
         </div>
       </div>
     )
@@ -421,13 +438,7 @@ export default function App() {
           <LogsPanel logs={logs} />
         </aside>
         <main className="main">
-          {backendError && (
-            <div className="placeholder" style={{ color: '#f87171' }}>
-              No se pudo conectar al backend: {backendError}<br />
-              <small>Asegúrate de que el backend esté corriendo en {API}</small>
-            </div>
-          )}
-          {!backendError && !selectedZone && (
+          {!selectedZone && (
             <div className="placeholder">Selecciona una zona para ver sus racks</div>
           )}
           {selectedZone && !selectedRack && (
@@ -439,18 +450,10 @@ export default function App() {
               onBack={() => setSelectedRack(null)}
               onCommand={sendCommand}
               recoveringNodes={recoveringNodes}
+              recoveryErrors={recoveryErrors}
             />
           )}
         </main>
-        <aside className="rightpanel">
-          <ZoneControls
-            zone={selectedZone ? zones.find(z => z.id === selectedZone.id) : null}
-            controls={selectedZone ? (zoneControls[selectedZone.id] || { hvac: 50, extractor: 50 }) : {}}
-            onChange={updateZoneControls}
-            selectedRack={selectedRack ? (zones.flatMap(z => z.racks).find(r => r.id === selectedRack.id) || selectedRack) : null}
-            hvacMode={selectedRack ? (hvacModeByRack[selectedRack.id] || 'off') : 'off'}
-          />
-        </aside>
       </div>
       <footer className="footer">
         Conectado al backend — datos en tiempo real vía WebSocket
